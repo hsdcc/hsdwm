@@ -10,12 +10,6 @@
  * - Super/Alt + q or a -> close (covers qwerty/azerty)
  * - Alt-Tab cycling between windows
  *
- * Build:
- *   gcc wm.c -o thing -lX11
- *
- * Run (safe):
- *   Xephyr -br -ac -noreset -screen 1280x720 :2 &
- *   DISPLAY=:2 ./thing >> thing.log 2>&1
  */
 
 /* --- CONFIG --- */
