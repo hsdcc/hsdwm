@@ -1,21 +1,36 @@
-/* wm.c
+/*
+ * hsdwm - floating + per-tag tiling with master layout
  *
- * Floating WM — better focus handling + move focused to workspace
+ * CONFIG
  *
- * - centered placement
- * - focus follows mouse (EnterNotify + PointerMotion) and raises window
- * - focused-only border
- * - Super and Alt share all bindings
- * - Super/Alt + Shift + 1..9 -> move focused window to workspace
- * - Super/Alt + q or a -> close (covers qwerty/azerty)
- * - Alt-Tab cycling between windows
+ * DEFAULT_TAG_MODE
+ *   0 -> FLOATING
+ *   1 -> TILING
+ *
+ * DEFAULT_MASTER_FACTOR
+ *   integer percent (e.g. 60) -> width percentage for master area
+ *
+ * Keybindings:
+ *   mod  +  t           -> toggle current workspace between tiling and floating
+ *   mod  +  shift  + t  -> toggle all workspaces
+ *   mod  +  h j k l     -> focus left / down / up / right (respectively) among windows on current tag
  *
  */
 
-/* --- CONFIG --- */
+#ifndef BORDER_PX_FOCUSED
+#  define BORDER_PX_FOCUSED 12
+#endif
 
-#ifndef BORDER_PX
-#  define BORDER_PX 8
+#ifndef BORDER_PX_UNFOCUSED
+#  define BORDER_PX_UNFOCUSED 12
+#endif
+
+#ifndef BORDER_COLOR_FOCUS
+#  define BORDER_COLOR_FOCUS "dodgerblue"
+#endif
+
+#ifndef BORDER_COLOR_UNFOCUS
+#  define BORDER_COLOR_UNFOCUS "gray"
 #endif
 
 #ifndef BORDER_COLOR_FOCUS
@@ -28,6 +43,19 @@
 
 #ifndef MOD_MAIN
 #  define MOD_MAIN Mod4Mask   /* Super by default; Alt (Mod1) is also accepted */
+#endif
+
+/* default mode applied to all tags at startup */
+#ifndef DEFAULT_TAG_MODE
+#  define DEFAULT_TAG_MODE 0   /* 0 = FLOATING, 1 = TILING */
+#endif
+
+#ifndef DEFAULT_MASTER_FACTOR
+#  define DEFAULT_MASTER_FACTOR 60  /* percent width for master area */
+#endif
+
+#ifndef DEFAULT_GAP
+#  define DEFAULT_GAP 8  /* pixels: outer gap and inner gap between master/stack and stack windows */
 #endif
 
 #define _POSIX_C_SOURCE 200809L
@@ -57,6 +85,9 @@
 static char *term_cmd[]  = { "xterm", NULL };
 static char *dmenu_cmd[] = { "dmenu_run", NULL };
 
+/* --- modes --- */
+enum { MODE_FLOATING = 0, MODE_TILING = 1 };
+
 /* --- client --- */
 typedef struct Client {
     Window win;
@@ -78,12 +109,17 @@ static Client *cycle_start = NULL;  // For Alt-Tab cycling
 
 static unsigned long border_focus_col;
 static unsigned long border_unfocus_col;
+static unsigned int border_focus_width;
+static unsigned int border_unfocus_width;
 
 static Atom ATOM_WM_PROTOCOLS;
 static Atom ATOM_WM_DELETE_WINDOW;
 
 static int current_workspace = 0;
 static int cycling = 0;  // Whether we're in Alt-Tab cycle mode
+
+/* per-tag mode */
+static int tag_mode[MAX_WORKSPACES];
 
 /* --- prototypes --- */
 static void spawn_program(char *const argv[]);
@@ -99,6 +135,12 @@ static void move_focused_to_workspace(int ws);
 static void start_cycle(void);
 static void cycle_focus(int forward);
 static void stop_cycle(void);
+
+/* new prototypes */
+static void tile_workspace(int ws);
+static void set_workspace_mode(int ws, int mode);
+static void set_mode_for_all(int mode);
+static void focus_dir(int dir);
 
 /* --- helpers --- */
 static void die(const char *msg) {
@@ -229,10 +271,10 @@ static void update_borders(void) {
             continue;
         }
         if (focused && c->win == focused->win) {
-            XSetWindowBorderWidth(dpy, c->win, BORDER_PX);
+            XSetWindowBorderWidth(dpy, c->win, border_focus_width);
             XSetWindowBorder(dpy, c->win, border_focus_col);
         } else {
-            XSetWindowBorderWidth(dpy, c->win, 0);
+            XSetWindowBorderWidth(dpy, c->win, border_unfocus_width);
             XSetWindowBorder(dpy, c->win, border_unfocus_col);
         }
     }
@@ -290,11 +332,15 @@ static void manage(Window w) {
     XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
     update_borders();
     write_focused_workspace_file(current_workspace);
+
+    /* if new client appears on a tiled tag, retile */
+    if (tag_mode[c->workspace] == MODE_TILING) tile_workspace(c->workspace);
 }
 
 static void unmanage(Window w) {
     Client *c = find_client(w);
     if (!c) return;
+    int ws = c->workspace;
     remove_client_from_list(c);
     free(c);
     write_occupied_workspace_file();
@@ -313,6 +359,9 @@ static void unmanage(Window w) {
             write_focused_workspace_file(current_workspace);
         }
     }
+
+    /* retile the workspace we removed from if tiled */
+    if (ws >= 0 && ws < MAX_WORKSPACES && tag_mode[ws] == MODE_TILING) tile_workspace(ws);
 }
 
 /* --- move / resize grabs --- */
@@ -364,6 +413,91 @@ static void resize_client(Client *c, int start_root_x, int start_root_y, unsigne
     XFreeCursor(dpy, cur);
 }
 
+/* --- simple tiling: equal vertical columns --- */
+static void tile_workspace(int ws) {
+    if (ws < 0 || ws >= MAX_WORKSPACES) return;
+    int count = 0;
+    for (Client *c = clients; c; c = c->next) if (c->workspace == ws) ++count;
+    if (count == 0) return;
+
+    int rw = DisplayWidth(dpy, screen_num);
+    int rh = DisplayHeight(dpy, screen_num);
+
+    int gap = DEFAULT_GAP;
+    int outer_gap = gap;
+    int inner_gap = gap;
+
+    int b = (int)border_unfocus_width; /* border size to account for; we assume equal widths by default */
+
+    int effective_outer = outer_gap + b;
+
+    /* available area after outer gaps and borders */
+    int avail_w = rw - 2 * effective_outer;
+    int avail_h = rh - 2 * effective_outer;
+    if (avail_w < MIN_WIN_W) avail_w = MIN_WIN_W;
+    if (avail_h < MIN_WIN_H) avail_h = MIN_WIN_H;
+
+    if (count == 1) {
+        for (Client *c = clients; c; c = c->next) if (c->workspace == ws) {
+            c->x = effective_outer;
+            c->y = effective_outer;
+            c->w = (unsigned int)(avail_w - 2 * b);
+            c->h = (unsigned int)(avail_h - 2 * b);
+            XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+        }
+        return;
+    }
+
+    int master_w = (avail_w * DEFAULT_MASTER_FACTOR) / 100;
+    if (master_w < MIN_WIN_W) master_w = MIN_WIN_W;
+
+    int stack_w = avail_w - master_w - inner_gap;
+    if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
+
+    int idx = 0;
+    int stack_count = count - 1;
+    int stack_idx = 0;
+
+    int total_stack_gap = (stack_count > 0) ? (stack_count - 1) * inner_gap : 0;
+    int stack_each_h = (stack_count > 0) ? (avail_h - total_stack_gap) / stack_count : avail_h;
+
+    for (Client *c = clients; c; c = c->next) {
+        if (c->workspace != ws) continue;
+        if (idx == 0) {
+            /* master */
+            c->x = effective_outer;
+            c->y = effective_outer;
+            c->w = (unsigned int)(master_w - 2 * b);
+            c->h = (unsigned int)(avail_h - 2 * b);
+            XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+        } else {
+            int ny = effective_outer + stack_idx * (stack_each_h + inner_gap);
+            int nh = (stack_idx == stack_count - 1) ? (avail_h - (stack_each_h + inner_gap) * (stack_count - 1)) : stack_each_h;
+
+            c->x = effective_outer + master_w + inner_gap;
+            c->y = ny;
+            c->w = (unsigned int)(stack_w - 2 * b);
+            c->h = (unsigned int)(nh - 2 * b);
+            XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+            ++stack_idx;
+        }
+        ++idx;
+    }
+}
+
+static void set_workspace_mode(int ws, int mode) {
+    if (ws < 0 || ws >= MAX_WORKSPACES) return;
+    tag_mode[ws] = (mode == MODE_TILING) ? MODE_TILING : MODE_FLOATING;
+    if (tag_mode[ws] == MODE_TILING) tile_workspace(ws);
+}
+
+static void set_mode_for_all(int mode) {
+    for (int w = 0; w < MAX_WORKSPACES; ++w) {
+        tag_mode[w] = (mode == MODE_TILING) ? MODE_TILING : MODE_FLOATING;
+        if (tag_mode[w] == MODE_TILING) tile_workspace(w);
+    }
+}
+
 /* --- workspaces --- */
 static void switch_workspace(int ws) {
     if (ws < 0 || ws >= MAX_WORKSPACES) return;
@@ -384,6 +518,10 @@ static void switch_workspace(int ws) {
         XRaiseWindow(dpy, focused->win);
         XSetInputFocus(dpy, focused->win, RevertToPointerRoot, CurrentTime);
     }
+
+    /* if tiled, perform tiling right away */
+    if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
+
     update_borders();
     write_focused_workspace_file(current_workspace);
     write_occupied_workspace_file();
@@ -396,6 +534,10 @@ static void move_focused_to_workspace(int ws) {
     focused->workspace = ws;
     if (focused->workspace != current_workspace) XUnmapWindow(dpy, focused->win);
     write_occupied_workspace_file();
+
+    /* retile source and destination if needed */
+    if (tag_mode[ws] == MODE_TILING) tile_workspace(ws);
+    if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
 }
 
 /* --- Alt-Tab cycling --- */
@@ -464,6 +606,13 @@ static void grab_keys_and_buttons(void) {
     grab_keycode_for_keysym_for_mods(XK_d);
     grab_keycode_for_keysym_for_mods(XK_f);
     grab_keycode_for_keysym_for_mods(XK_Tab);
+    grab_keycode_for_keysym_for_mods(XK_t); /* toggle mode */
+
+    /* focus with hjkl */
+    grab_keycode_for_keysym_for_mods(XK_h);
+    grab_keycode_for_keysym_for_mods(XK_j);
+    grab_keycode_for_keysym_for_mods(XK_k);
+    grab_keycode_for_keysym_for_mods(XK_l);
 
     /* digits qwerty */
     for (int i = 0; i < MAX_WORKSPACES; ++i) {
@@ -491,7 +640,7 @@ static void grab_keys_and_buttons(void) {
         XGrabButton(dpy, Button1, base, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
         XGrabButton(dpy, Button3, base, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
     }
-}
+} 
 
 /* --- key mapping helper --- */
 static int keysym_to_workspace(KeySym ks) {
@@ -531,6 +680,29 @@ static void focus_window_at_pointer(void) {
     /* ret_child is the immediate child — find top-level client from that */
     Client *c = find_toplevel_client_from_window(ret_child ? ret_child : ret_root);
     if (c && c->workspace == current_workspace) focus_client_proper(c);
+}
+
+static void focus_dir(int dir) {
+    if (!clients) return;
+    Client *c = focused;
+    if (!c) {
+        for (c = clients; c && c->workspace != current_workspace; c = c->next);
+        if (!c) return;
+    }
+    Client *start = c;
+    Client *iter = c;
+    Client *last = clients;
+    while (last && last->next) last = last->next;
+
+    do {
+        if (dir > 0) iter = iter->next ? iter->next : clients;
+        else iter = iter->prev ? iter->prev : last;
+        if (!iter) iter = clients;
+        if (iter->workspace == current_workspace && iter != start) {
+            focus_client_proper(iter);
+            return;
+        }
+    } while (iter != start);
 }
 
 /* --- event handlers --- */
@@ -608,6 +780,28 @@ static void handle_keypress(XEvent *ev) {
         if (!cycling) start_cycle();
         cycle_focus(!(ke->state & ShiftMask));  // Shift reverses direction
         return;
+    }
+
+    /* toggle tag mode: mod + t  (mod + shift + t -> apply to all tags) */
+    if ((state & mod_accept) && ks == XK_t) {
+        if (ke->state & ShiftMask) {
+            /* toggle all tags to the opposite of current tag */
+            int newmode = (tag_mode[0] == MODE_TILING) ? MODE_FLOATING : MODE_TILING;
+            set_mode_for_all(newmode);
+        } else {
+            int ws = current_workspace;
+            int newmode = (tag_mode[ws] == MODE_TILING) ? MODE_FLOATING : MODE_TILING;
+            set_workspace_mode(ws, newmode);
+        }
+        return;
+    }
+
+    /* focus with hjkl (both Super and Alt accepted) */
+    if ((state & mod_accept) && (ks == XK_h || ks == XK_j || ks == XK_k || ks == XK_l)) {
+        if (ks == XK_h) { focus_dir(-1); return; }
+        if (ks == XK_l) { focus_dir(1); return; }
+        if (ks == XK_j) { focus_dir(1); return; }
+        if (ks == XK_k) { focus_dir(-1); return; }
     }
 
     /* general mod keys (either Super or Alt) */
@@ -748,6 +942,11 @@ int main(void) {
 
     border_focus_col   = alloc_color(BORDER_COLOR_FOCUS);
     border_unfocus_col = alloc_color(BORDER_COLOR_UNFOCUS);
+    border_focus_width = BORDER_PX_FOCUSED;
+    border_unfocus_width = BORDER_PX_UNFOCUSED;
+
+    /* initialize per-tag modes from DEFAULT_TAG_MODE */
+    for (int i = 0; i < MAX_WORKSPACES; ++i) tag_mode[i] = (DEFAULT_TAG_MODE ? MODE_TILING : MODE_FLOATING);
 
     if (XSelectInput(dpy, root,
                      SubstructureRedirectMask | SubstructureNotifyMask |
@@ -761,6 +960,9 @@ int main(void) {
 
     scan_existing_windows();
 
+    /* if a workspace is tiled, perform tiling on it at startup */
+    for (int i = 0; i < MAX_WORKSPACES; ++i) if (tag_mode[i] == MODE_TILING) tile_workspace(i);
+
     write_focused_workspace_file(current_workspace);
     write_occupied_workspace_file();
 
@@ -769,3 +971,4 @@ int main(void) {
     XCloseDisplay(dpy);
     return 0;
 }
+
