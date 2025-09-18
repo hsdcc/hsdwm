@@ -140,7 +140,7 @@ static void stop_cycle(void);
 static void tile_workspace(int ws);
 static void set_workspace_mode(int ws, int mode);
 static void set_mode_for_all(int mode);
-static void focus_dir(int dir);
+static void focus_in_direction(int dir);
 
 /* --- helpers --- */
 static void die(const char *msg) {
@@ -682,27 +682,71 @@ static void focus_window_at_pointer(void) {
     if (c && c->workspace == current_workspace) focus_client_proper(c);
 }
 
-static void focus_dir(int dir) {
-    if (!clients) return;
-    Client *c = focused;
-    if (!c) {
-        for (c = clients; c && c->workspace != current_workspace; c = c->next);
-        if (!c) return;
-    }
-    Client *start = c;
-    Client *iter = c;
-    Client *last = clients;
-    while (last && last->next) last = last->next;
+static void focus_in_direction(int dir) {
+    /* dir:
+       0 -> left
+       1 -> down
+       2 -> up
+       3 -> right
+    */
 
-    do {
-        if (dir > 0) iter = iter->next ? iter->next : clients;
-        else iter = iter->prev ? iter->prev : last;
-        if (!iter) iter = clients;
-        if (iter->workspace == current_workspace && iter != start) {
-            focus_client_proper(iter);
-            return;
+    if (!clients) return;
+
+    Client *cur = focused;
+    if (!cur) {
+        for (cur = clients; cur && cur->workspace != current_workspace; cur = cur->next);
+        if (!cur) return;
+    }
+
+    int fx = cur->x + (int)cur->w / 2;
+    int fy = cur->y + (int)cur->h / 2;
+
+    Client *best = NULL;
+    long long best_score = LLONG_MAX;
+
+    /* first pass: strictly in the requested direction */
+    for (Client *c = clients; c; c = c->next) {
+        if (c->workspace != current_workspace) continue;
+        if (c == cur) continue;
+
+        int cx = c->x + (int)c->w / 2;
+        int cy = c->y + (int)c->h / 2;
+
+        int dx = cx - fx;
+        int dy = cy - fy;
+
+        int ok = 0;
+        switch (dir) {
+            case 0: /* left  */ ok = (cx < fx); break;
+            case 1: /* down  */ ok = (cy > fy); break;
+            case 2: /* up    */ ok = (cy < fy); break;
+            case 3: /* right */ ok = (cx > fx); break;
+            default: ok = 0; break;
         }
-    } while (iter != start);
+        if (!ok) continue;
+
+        long long score = (long long)dx * (long long)dx + (long long)dy * (long long)dy;
+        if (score < best_score) { best_score = score; best = c; }
+    }
+
+    /* fallback: nearest neighbor regardless of direction */
+    if (!best) {
+        for (Client *c = clients; c; c = c->next) {
+            if (c->workspace != current_workspace) continue;
+            if (c == cur) continue;
+
+            int cx = c->x + (int)c->w / 2;
+            int cy = c->y + (int)c->h / 2;
+
+            int dx = cx - fx;
+            int dy = cy - fy;
+
+            long long score = (long long)dx * (long long)dx + (long long)dy * (long long)dy;
+            if (score < best_score) { best_score = score; best = c; }
+        }
+    }
+
+    if (best) focus_client_proper(best);
 }
 
 /* --- event handlers --- */
@@ -798,10 +842,10 @@ static void handle_keypress(XEvent *ev) {
 
     /* focus with hjkl (both Super and Alt accepted) */
     if ((state & mod_accept) && (ks == XK_h || ks == XK_j || ks == XK_k || ks == XK_l)) {
-        if (ks == XK_h) { focus_dir(-1); return; }
-        if (ks == XK_l) { focus_dir(1); return; }
-        if (ks == XK_j) { focus_dir(1); return; }
-        if (ks == XK_k) { focus_dir(-1); return; }
+        if (ks == XK_h) { focus_in_direction(0); return; } /* left  */
+        if (ks == XK_j) { focus_in_direction(1); return; } /* down  */
+        if (ks == XK_k) { focus_in_direction(2); return; } /* up    */
+        if (ks == XK_l) { focus_in_direction(3); return; } /* right */
     }
 
     /* general mod keys (either Super or Alt) */
