@@ -1,20 +1,9 @@
 /*
  * hsdwm - floating + per-tag tiling with master layout
  *
- * CONFIG
- *
- * DEFAULT_TAG_MODE
- *   0 -> FLOATING
- *   1 -> TILING
- *
- * DEFAULT_MASTER_FACTOR
- *   integer percent (e.g. 60) -> width percentage for master area
- *
- * Keybindings:
- *   mod  +  t           -> toggle current workspace between tiling and floating
- *   mod  +  shift  + t  -> toggle all workspaces
- *   mod  +  h j k l     -> focus left / down / up / right (respectively) among windows on current tag
- *   mod  +  shift  + h j k l -> promote nearest window in that direction to master (tiling only)
+ * Behavior:
+ *   mod  +  h j k l  or  arrows       -> focus left / down / up / right
+ *   mod  +  shift  +  h j k l  or arrows -> swap focused window with neighbor (sway/i3 style)
  *
  */
 
@@ -46,7 +35,6 @@
 #  define MOD_MAIN Mod4Mask   /* Super by default; Alt (Mod1) is also accepted */
 #endif
 
-/* default mode applied to all tags at startup */
 #ifndef DEFAULT_TAG_MODE
 #  define DEFAULT_TAG_MODE 0   /* 0 = FLOATING, 1 = TILING */
 #endif
@@ -56,7 +44,7 @@
 #endif
 
 #ifndef DEFAULT_GAP
-#  define DEFAULT_GAP 8  /* pixels: outer gap and inner gap between master/stack and stack windows */
+#  define DEFAULT_GAP 8
 #endif
 
 #define _POSIX_C_SOURCE 200809L
@@ -96,7 +84,7 @@ typedef struct Client {
     unsigned int w, h;
     int workspace;
     struct Client *next;
-    struct Client *prev;  // For maintaining window order
+    struct Client *prev;
 } Client;
 
 /* --- globals --- */
@@ -106,7 +94,7 @@ static Window root;
 
 static Client *clients = NULL;
 static Client *focused = NULL;
-static Client *cycle_start = NULL;  // For Alt-Tab cycling
+static Client *cycle_start = NULL;
 
 static unsigned long border_focus_col;
 static unsigned long border_unfocus_col;
@@ -117,9 +105,8 @@ static Atom ATOM_WM_PROTOCOLS;
 static Atom ATOM_WM_DELETE_WINDOW;
 
 static int current_workspace = 0;
-static int cycling = 0;  // Whether we're in Alt-Tab cycle mode
+static int cycling = 0;
 
-/* per-tag mode */
 static int tag_mode[MAX_WORKSPACES];
 
 /* --- prototypes --- */
@@ -137,15 +124,14 @@ static void start_cycle(void);
 static void cycle_focus(int forward);
 static void stop_cycle(void);
 
-/* new prototypes */
 static void tile_workspace(int ws);
 static void set_workspace_mode(int ws, int mode);
 static void set_mode_for_all(int mode);
 static void focus_in_direction(int dir);
 
-/* new helpers for master promotion */
+/* new: improved neighbor finder + swap */
 static Client *find_neighbor_in_direction(Client *cur, int dir);
-static void promote_to_master(Client *c);
+static void swap_clients(Client *a, Client *b);
 
 /* --- helpers --- */
 static void die(const char *msg) {
@@ -222,7 +208,6 @@ static Client *find_client(Window w) {
     return NULL;
 }
 
-/* walk up parent chain to find top-level client we manage */
 static Client *find_toplevel_client_from_window(Window w) {
     if (!w) return NULL;
     Client *c = find_client(w);
@@ -268,7 +253,7 @@ static void clamp_size(unsigned int *w, unsigned int *h) {
     if (*h > maxh) *h = maxh;
 }
 
-/* --- border update (focused only) --- */
+/* --- borders --- */
 static void update_borders(void) {
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace != current_workspace) {
@@ -307,18 +292,15 @@ static void manage(Window w) {
 
     clamp_size(&c->w, &c->h);
 
-    /* CENTER ONLY */
     int sw = DisplayWidth(dpy, screen_num);
     int sh = DisplayHeight(dpy, screen_num);
     int cx = (sw - (int)c->w) / 2;
     int cy = (sh - (int)c->h) / 2;
     c->x = cx; c->y = cy;
 
-    /* default no visible border */
     XSetWindowBorderWidth(dpy, c->win, 0);
     XSetWindowBorder(dpy, c->win, border_unfocus_col);
 
-    /* place window but otherwise keep attributes */
     XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
     XSelectInput(dpy, c->win, EnterWindowMask | FocusChangeMask | PropertyChangeMask | StructureNotifyMask | ButtonPressMask);
@@ -331,14 +313,12 @@ static void manage(Window w) {
 
     write_occupied_workspace_file();
 
-    /* focus & raise */
     focused = c;
     XRaiseWindow(dpy, c->win);
     XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
     update_borders();
     write_focused_workspace_file(current_workspace);
 
-    /* if new client appears on a tiled tag, retile */
     if (tag_mode[c->workspace] == MODE_TILING) tile_workspace(c->workspace);
 }
 
@@ -365,11 +345,10 @@ static void unmanage(Window w) {
         }
     }
 
-    /* retile the workspace we removed from if tiled */
     if (ws >= 0 && ws < MAX_WORKSPACES && tag_mode[ws] == MODE_TILING) tile_workspace(ws);
 }
 
-/* --- move / resize grabs --- */
+/* --- move / resize --- */
 static void move_client(Client *c, int start_root_x, int start_root_y, int start_x, int start_y) {
     if (!c) return;
     XEvent ev;
@@ -418,7 +397,7 @@ static void resize_client(Client *c, int start_root_x, int start_root_y, unsigne
     XFreeCursor(dpy, cur);
 }
 
-/* --- simple tiling: equal vertical columns --- */
+/* --- tiling --- */
 static void tile_workspace(int ws) {
     if (ws < 0 || ws >= MAX_WORKSPACES) return;
     int count = 0;
@@ -432,11 +411,10 @@ static void tile_workspace(int ws) {
     int outer_gap = gap;
     int inner_gap = gap;
 
-    int b = (int)border_unfocus_width; /* border size to account for; we assume equal widths by default */
+    int b = (int)border_unfocus_width;
 
     int effective_outer = outer_gap + b;
 
-    /* available area after outer gaps and borders */
     int avail_w = rw - 2 * effective_outer;
     int avail_h = rh - 2 * effective_outer;
     if (avail_w < MIN_WIN_W) avail_w = MIN_WIN_W;
@@ -469,7 +447,6 @@ static void tile_workspace(int ws) {
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace != ws) continue;
         if (idx == 0) {
-            /* master */
             c->x = effective_outer;
             c->y = effective_outer;
             c->w = (unsigned int)(master_w - 2 * b);
@@ -514,7 +491,6 @@ static void switch_workspace(int ws) {
         else XUnmapWindow(dpy, c->win);
     }
 
-    /* pick focus */
     focused = NULL;
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace == current_workspace) { focused = c; break; }
@@ -524,7 +500,6 @@ static void switch_workspace(int ws) {
         XSetInputFocus(dpy, focused->win, RevertToPointerRoot, CurrentTime);
     }
 
-    /* if tiled, perform tiling right away */
     if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
 
     update_borders();
@@ -532,7 +507,6 @@ static void switch_workspace(int ws) {
     write_occupied_workspace_file();
 }
 
-/* move focused window to workspace */
 static void move_focused_to_workspace(int ws) {
     if (!focused) return;
     if (ws < 0 || ws >= MAX_WORKSPACES) return;
@@ -540,12 +514,11 @@ static void move_focused_to_workspace(int ws) {
     if (focused->workspace != current_workspace) XUnmapWindow(dpy, focused->win);
     write_occupied_workspace_file();
 
-    /* retile source and destination if needed */
     if (tag_mode[ws] == MODE_TILING) tile_workspace(ws);
     if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
 }
 
-/* --- Alt-Tab cycling --- */
+/* --- Alt-Tab --- */
 static void start_cycle(void) {
     if (!clients) return;
     cycling = 1;
@@ -554,21 +527,21 @@ static void start_cycle(void) {
 
 static void cycle_focus(int forward) {
     if (!clients || !cycling) return;
-    
+
     Client *start = focused ? focused : clients;
     Client *c = start;
-    
+
     do {
         c = forward ? (c->next ? c->next : clients) : (c->prev ? c->prev : NULL);
-        if (!c) c = clients;  // Wrap around to beginning
+        if (!c) c = clients;
         while (c && c->workspace != current_workspace) {
             c = forward ? (c->next ? c->next : clients) : (c->prev ? c->prev : NULL);
-            if (!c) c = clients;  // Wrap around
-            if (c == start) break;  // Prevent infinite loop
+            if (!c) c = clients;
+            if (c == start) break;
         }
         if (c && c->workspace == current_workspace) break;
     } while (c && c != start);
-    
+
     if (c && c != focused) {
         focused = c;
         XRaiseWindow(dpy, focused->win);
@@ -582,9 +555,7 @@ static void stop_cycle(void) {
     cycle_start = NULL;
 }
 
-/* --- key / mouse grabbing helpers --- */
-
-/* include shift variants in mask list so Shift combos are captured too */
+/* --- key grabbing --- */
 static void grab_keycode_for_keysym_for_mods(KeySym keysym) {
     unsigned int bases[2] = { MOD_MAIN, Mod1Mask };
     for (int b = 0; b < 2; ++b) {
@@ -606,48 +577,47 @@ static void grab_keycode_for_keysym_for_mods(KeySym keysym) {
 }
 
 static void grab_keys_and_buttons(void) {
-    /* main shortcuts (both Super and Alt) */
     grab_keycode_for_keysym_for_mods(XK_Return);
     grab_keycode_for_keysym_for_mods(XK_d);
     grab_keycode_for_keysym_for_mods(XK_f);
     grab_keycode_for_keysym_for_mods(XK_Tab);
-    grab_keycode_for_keysym_for_mods(XK_t); /* toggle mode */
+    grab_keycode_for_keysym_for_mods(XK_t);
 
-    /* focus with hjkl */
     grab_keycode_for_keysym_for_mods(XK_h);
     grab_keycode_for_keysym_for_mods(XK_j);
     grab_keycode_for_keysym_for_mods(XK_k);
     grab_keycode_for_keysym_for_mods(XK_l);
 
-    /* digits qwerty */
+    /* arrows too */
+    grab_keycode_for_keysym_for_mods(XK_Left);
+    grab_keycode_for_keysym_for_mods(XK_Down);
+    grab_keycode_for_keysym_for_mods(XK_Up);
+    grab_keycode_for_keysym_for_mods(XK_Right);
+
     for (int i = 0; i < MAX_WORKSPACES; ++i) {
         grab_keycode_for_keysym_for_mods(XK_1 + i);
     }
 
-    /* azerty top row */
     KeySym french_top[MAX_WORKSPACES] = {
         XK_ampersand, XK_eacute, XK_quotedbl, XK_apostrophe, XK_parenleft,
         XK_minus, XK_egrave, XK_underscore, XK_ccedilla
     };
     for (int i = 0; i < MAX_WORKSPACES; ++i) grab_keycode_for_keysym_for_mods(french_top[i]);
 
-    /* closing: support both q and a (covers azerty/qwerty) */
     grab_keycode_for_keysym_for_mods(XK_q);
     grab_keycode_for_keysym_for_mods(XK_a);
 
-    /* exit with mod + shift + e (both mods captured by masks array) */
     grab_keycode_for_keysym_for_mods(XK_e);
 
-    /* buttons: both mods for left/right */
     unsigned int bases[2] = { MOD_MAIN, Mod1Mask };
     for (int b = 0; b < 2; ++b) {
         unsigned int base = bases[b];
         XGrabButton(dpy, Button1, base, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
         XGrabButton(dpy, Button3, base, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
     }
-} 
+}
 
-/* --- key mapping helper --- */
+/* --- key -> workspace --- */
 static int keysym_to_workspace(KeySym ks) {
     if (ks >= XK_1 && ks <= XK_9) return (int)(ks - XK_1);
     if (ks == XK_ampersand)    return 0;
@@ -663,12 +633,10 @@ static int keysym_to_workspace(KeySym ks) {
 }
 
 /* --- focus helpers --- */
-
-/* centralize focus actions to avoid duplication */
 static void focus_client_proper(Client *c) {
     if (!c) return;
     if (c->workspace != current_workspace) return;
-    if (focused && focused == c) return; /* already focused */
+    if (focused && focused == c) return;
     focused = c;
     XRaiseWindow(dpy, c->win);
     XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
@@ -676,124 +644,203 @@ static void focus_client_proper(Client *c) {
     write_focused_workspace_file(current_workspace);
 }
 
-/* try to find the window under the pointer and focus it */
 static void focus_window_at_pointer(void) {
     Window ret_root, ret_child;
     int root_x, root_y, win_x, win_y;
     unsigned int mask;
     if (!XQueryPointer(dpy, root, &ret_root, &ret_child, &root_x, &root_y, &win_x, &win_y, &mask)) return;
-    /* ret_child is the immediate child — find top-level client from that */
     Client *c = find_toplevel_client_from_window(ret_child ? ret_child : ret_root);
     if (c && c->workspace == current_workspace) focus_client_proper(c);
 }
 
-/* helper that returns nearest neighbor in given direction, or NULL */
+/* helper: compute overlap length between [a1,a2) and [b1,b2) */
+static int overlap_len(int a1, int a2, int b1, int b2) {
+    int lo = a1 > b1 ? a1 : b1;
+    int hi = a2 < b2 ? a2 : b2;
+    return (hi > lo) ? (hi - lo) : 0;
+}
+
+/* --- improved directional finder (sway/i3-like) ---
+   dir:
+     0 -> left
+     1 -> down
+     2 -> up
+     3 -> right
+
+   algorithm:
+     - prefer candidates that lie in the requested half-plane (by edge).
+     - among those prefer overlapping candidates (on perpendicular axis).
+     - score: primary edge distance (small is better) weighted heavily,
+              plus a small perpendicular distance penalty.
+     - fallback to nearest-center if nothing in half-plane.
+*/
 static Client *find_neighbor_in_direction(Client *cur, int dir) {
     if (!clients) return NULL;
-    if (!cur) {
-        for (cur = clients; cur && cur->workspace != current_workspace; cur = cur->next);
-        if (!cur) return NULL;
-    }
 
-    int fx = cur->x + (int)cur->w / 2;
-    int fy = cur->y + (int)cur->h / 2;
+    /* pick a start focused client on current workspace */
+    Client *start = cur;
+    if (!start || start->workspace != current_workspace) {
+        for (start = clients; start && start->workspace != current_workspace; start = start->next);
+        if (!start) return NULL;
+    }
+    cur = start;
+
+    int cx1 = cur->x;
+    int cy1 = cur->y;
+    int cx2 = cur->x + (int)cur->w;
+    int cy2 = cur->y + (int)cur->h;
+    int ccx = cx1 + (int)cur->w / 2;
+    int ccy = cy1 + (int)cur->h / 2;
 
     Client *best = NULL;
     long long best_score = LLONG_MAX;
+    int found_in_dir = 0;
 
-    /* first pass: strictly in the requested direction */
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace != current_workspace) continue;
         if (c == cur) continue;
 
-        int cx = c->x + (int)c->w / 2;
-        int cy = c->y + (int)c->h / 2;
+        int ax1 = c->x;
+        int ay1 = c->y;
+        int ax2 = c->x + (int)c->w;
+        int ay2 = c->y + (int)c->h;
+        int acx = ax1 + (int)c->w / 2;
+        int acy = ay1 + (int)c->h / 2;
 
-        int dx = cx - fx;
-        int dy = cy - fy;
+        int overlap_perp = 0;
+        int in_dir = 0;
+        long long primary = 0;
+        long long secondary = 0;
 
-        int ok = 0;
-        switch (dir) {
-            case 0: /* left  */ ok = (cx < fx); break;
-            case 1: /* down  */ ok = (cy > fy); break;
-            case 2: /* up    */ ok = (cy < fy); break;
-            case 3: /* right */ ok = (cx > fx); break;
-            default: ok = 0; break;
+        if (dir == 0) { /* left: candidate should be to the left */
+            overlap_perp = overlap_len(ay1, ay2, cy1, cy2);
+            if (ax2 <= cx1) {
+                in_dir = 1;
+                primary = (long long)(cx1 - ax2);
+            } else if (overlap_perp > 0 && ax1 < cx1) {
+                in_dir = 1;
+                primary = 0;
+            } else {
+                in_dir = 0;
+                primary = (long long)abs(acx - ccx);
+            }
+            secondary = overlap_perp > 0 ? 0 : (long long)abs(acy - ccy);
+        } else if (dir == 3) { /* right */
+            overlap_perp = overlap_len(ay1, ay2, cy1, cy2);
+            if (ax1 >= cx2) {
+                in_dir = 1;
+                primary = (long long)(ax1 - cx2);
+            } else if (overlap_perp > 0 && ax2 > cx2) {
+                in_dir = 1;
+                primary = 0;
+            } else {
+                in_dir = 0;
+                primary = (long long)abs(acx - ccx);
+            }
+            secondary = overlap_perp > 0 ? 0 : (long long)abs(acy - ccy);
+        } else if (dir == 2) { /* up */
+            overlap_perp = overlap_len(ax1, ax2, cx1, cx2);
+            if (ay2 <= cy1) {
+                in_dir = 1;
+                primary = (long long)(cy1 - ay2);
+            } else if (overlap_perp > 0 && ay1 < cy1) {
+                in_dir = 1;
+                primary = 0;
+            } else {
+                in_dir = 0;
+                primary = (long long)abs(acy - ccy);
+            }
+            secondary = overlap_perp > 0 ? 0 : (long long)abs(acx - ccx);
+        } else { /* down */
+            overlap_perp = overlap_len(ax1, ax2, cx1, cx2);
+            if (ay1 >= cy2) {
+                in_dir = 1;
+                primary = (long long)(ay1 - cy2);
+            } else if (overlap_perp > 0 && ay2 > cy2) {
+                in_dir = 1;
+                primary = 0;
+            } else {
+                in_dir = 0;
+                primary = (long long)abs(acy - ccy);
+            }
+            secondary = overlap_perp > 0 ? 0 : (long long)abs(acx - ccx);
         }
-        if (!ok) continue;
 
-        long long score = (long long)dx * (long long)dx + (long long)dy * (long long)dy;
-        if (score < best_score) { best_score = score; best = c; }
-    }
+        long long score = primary * 100000LL + secondary * 100LL;
 
-    /* fallback: nearest neighbor regardless of direction */
-    if (!best) {
-        for (Client *c = clients; c; c = c->next) {
-            if (c->workspace != current_workspace) continue;
-            if (c == cur) continue;
+        if (in_dir) {
+            score -= 1000000000LL;
+            found_in_dir = 1;
+            if (overlap_perp > 0) score -= 500000000LL;
+        }
 
-            int cx = c->x + (int)c->w / 2;
-            int cy = c->y + (int)c->h / 2;
+        if (!found_in_dir) {
+            long long dx = (long long)(acx - ccx);
+            long long dy = (long long)(acy - ccy);
+            long long center_dist = dx * dx + dy * dy;
+            score = center_dist;
+        }
 
-            int dx = cx - fx;
-            int dy = cy - fy;
-
-            long long score = (long long)dx * (long long)dx + (long long)dy * (long long)dy;
-            if (score < best_score) { best_score = score; best = c; }
+        if (score < best_score) {
+            best_score = score;
+            best = c;
         }
     }
 
     return best;
 }
 
-static void focus_in_direction(int dir) {
-    Client *best = find_neighbor_in_direction(focused, dir);
-    if (best) focus_client_proper(best);
+/* swap two nodes in the global clients linked list.
+   only swap if both are non-null and in same workspace (safer).
+   keep focused pointer unchanged (focus stays on the same window).
+*/
+static void swap_clients(Client *a, Client *b) {
+    if (!a || !b || a == b) return;
+    if (a->workspace != b->workspace) return;
+
+    Client *a_prev = a->prev;
+    Client *a_next = a->next;
+    Client *b_prev = b->prev;
+    Client *b_next = b->next;
+
+    if (a_next == b) {
+        if (a_prev) a_prev->next = b;
+        b->prev = a_prev;
+
+        a->next = b_next;
+        if (b_next) b_next->prev = a;
+
+        b->next = a;
+        a->prev = b;
+    } else if (b_next == a) {
+        if (b_prev) b_prev->next = a;
+        a->prev = b_prev;
+
+        b->next = a_next;
+        if (a_next) a_next->prev = b;
+
+        a->next = b;
+        b->prev = a;
+    } else {
+        if (a_prev) a_prev->next = b;
+        if (a_next) a_next->prev = b;
+        if (b_prev) b_prev->next = a;
+        if (b_next) b_next->prev = a;
+
+        a->prev = b_prev;
+        a->next = b_next;
+        b->prev = a_prev;
+        b->next = a_next;
+    }
+
+    if (clients == a) clients = b;
+    else if (clients == b) clients = a;
 }
 
-/* promote c to be first among its workspace so it becomes master when tiled */
-static void promote_to_master(Client *c) {
-    if (!c) return;
-
-    /* only meaningful if tiled */
-    if (c->workspace < 0 || c->workspace >= MAX_WORKSPACES) return;
-    if (tag_mode[c->workspace] != MODE_TILING) return;
-
-    /* if already the first for that workspace, nothing to do */
-    /* find first client for this workspace */
-    Client *first_same = NULL;
-    for (Client *p = clients; p; p = p->next) {
-        if (p->workspace == c->workspace) { first_same = p; break; }
-    }
-    if (!first_same || first_same == c) {
-        /* either no others or already first */
-        return;
-    }
-
-    /* remove c from list */
-    if (c->prev) c->prev->next = c->next;
-    if (c->next) c->next->prev = c->prev;
-    if (clients == c) clients = c->next;
-
-    /* insert c before first_same */
-    c->next = first_same;
-    c->prev = first_same->prev;
-    first_same->prev = c;
-    if (c->prev) c->prev->next = c;
-    else clients = c;
-
-    /* ensure it's visible / focused / tiled */
-    XRaiseWindow(dpy, c->win);
-    XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
-    focused = c;
-    update_borders();
-
-    /* retile that workspace */
-    tile_workspace(c->workspace);
-
-    /* persist state files */
-    write_focused_workspace_file(current_workspace);
-    write_occupied_workspace_file();
+/* define the missing focus_in_direction wrapper so the prototype isn't unused */
+static void focus_in_direction(int dir) {
+    Client *cand = find_neighbor_in_direction(focused, dir);
+    if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
 }
 
 /* --- event handlers --- */
@@ -820,14 +867,12 @@ static void handle_configurerequest(XEvent *ev) {
     }
 }
 
-/* EnterNotify: focus + raise */
 static void handle_enternotify(XEvent *ev) {
     Window w = ev->xcrossing.window;
     Client *c = find_toplevel_client_from_window(w);
     if (c && c->workspace == current_workspace) focus_client_proper(c);
 }
 
-/* MotionNotify on root: try to focus what's under pointer (helps when windows overlap) */
 static void handle_motionnotify(XEvent *ev) {
     (void)ev;
     focus_window_at_pointer();
@@ -849,34 +894,27 @@ static void handle_buttonpress(XEvent *ev) {
 static void handle_keypress(XEvent *ev) {
     XKeyEvent *ke = &ev->xkey;
     KeySym ks = XLookupKeysym(ke, 0);
-    /* mask off locks so Caps/NumLock don't break modifiers */
     unsigned int state = ke->state & ~(LockMask | Mod2Mask);
-
     unsigned int mod_accept = MOD_MAIN | Mod1Mask;
 
-    /* close: either mod + 'q' or mod + 'a' (qwerty/azerty physical key) */
     if ((state & mod_accept) && (ks == XK_q || ks == XK_a)) {
         if (focused) { send_wm_delete(focused->win); }
         return;
     }
 
-    /* move focused to workspace: mod + shift + number (both mods accepted) */
     if ((state & mod_accept) && (ke->state & ShiftMask)) {
         int ws = keysym_to_workspace(ks);
         if (ws >= 0 && ws < MAX_WORKSPACES) { move_focused_to_workspace(ws); return; }
     }
 
-    /* Alt-Tab cycling */
     if ((state & mod_accept) && ks == XK_Tab) {
         if (!cycling) start_cycle();
-        cycle_focus(!(ke->state & ShiftMask));  // Shift reverses direction
+        cycle_focus(!(ke->state & ShiftMask));
         return;
     }
 
-    /* toggle tag mode: mod + t  (mod + shift + t -> apply to all tags) */
     if ((state & mod_accept) && ks == XK_t) {
         if (ke->state & ShiftMask) {
-            /* toggle all tags to the opposite of current tag */
             int newmode = (tag_mode[0] == MODE_TILING) ? MODE_FLOATING : MODE_TILING;
             set_mode_for_all(newmode);
         } else {
@@ -887,34 +925,33 @@ static void handle_keypress(XEvent *ev) {
         return;
     }
 
-    /* focus with hjkl (both Super and Alt accepted)
-       if Shift is held, promote nearest in that direction to master (tiling only)
-    */
-    if ((state & mod_accept) && (ks == XK_h || ks == XK_j || ks == XK_k || ks == XK_l)) {
-        int dir = 0;
-        if (ks == XK_h) dir = 0;
-        else if (ks == XK_j) dir = 1;
-        else if (ks == XK_k) dir = 2;
-        else if (ks == XK_l) dir = 3;
+    /* map arrows to hjkl behavior */
+    int dir = -1;
+    if (ks == XK_h || ks == XK_Left) dir = 0;
+    else if (ks == XK_j || ks == XK_Down) dir = 1;
+    else if (ks == XK_k || ks == XK_Up) dir = 2;
+    else if (ks == XK_l || ks == XK_Right) dir = 3;
 
+    if ((state & mod_accept) && dir != -1) {
         if (ke->state & ShiftMask) {
-            /* promote nearest window in that direction to master (tiling only) */
+            /* swap focused with neighbor in that direction (sway-like) */
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
             if (cand && cand->workspace == current_workspace) {
-                promote_to_master(cand);
+                swap_clients(focused, cand);
+                if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
+                update_borders();
+                write_occupied_workspace_file();
             }
             return;
         } else {
-            /* normal focus */
-            if (ks == XK_h) { focus_in_direction(0); return; } /* left  */
-            if (ks == XK_j) { focus_in_direction(1); return; } /* down  */
-            if (ks == XK_k) { focus_in_direction(2); return; } /* up    */
-            if (ks == XK_l) { focus_in_direction(3); return; } /* right */
+            /* normal focus movement */
+            Client *cand = find_neighbor_in_direction(focused, dir);
+            if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+            return;
         }
     }
 
-    /* general mod keys (either Super or Alt) */
     if (state & mod_accept) {
         if (ks == XK_Return) { spawn_program(term_cmd); return; }
         if (ks == XK_d) { spawn_program(dmenu_cmd); return; }
@@ -931,7 +968,6 @@ static void handle_keyrelease(XEvent *ev) {
     unsigned int state = ke->state & ~(LockMask | Mod2Mask);
     unsigned int mod_accept = MOD_MAIN | Mod1Mask;
 
-    /* Stop Alt-Tab cycling when Alt is released */
     if ((state & mod_accept) && ks == XK_Tab) {
         stop_cycle();
     }
@@ -1055,7 +1091,6 @@ int main(void) {
     border_focus_width = BORDER_PX_FOCUSED;
     border_unfocus_width = BORDER_PX_UNFOCUSED;
 
-    /* initialize per-tag modes from DEFAULT_TAG_MODE */
     for (int i = 0; i < MAX_WORKSPACES; ++i) tag_mode[i] = (DEFAULT_TAG_MODE ? MODE_TILING : MODE_FLOATING);
 
     if (XSelectInput(dpy, root,
@@ -1070,7 +1105,6 @@ int main(void) {
 
     scan_existing_windows();
 
-    /* if a workspace is tiled, perform tiling on it at startup */
     for (int i = 0; i < MAX_WORKSPACES; ++i) if (tag_mode[i] == MODE_TILING) tile_workspace(i);
 
     write_focused_workspace_file(current_workspace);
