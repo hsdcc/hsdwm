@@ -14,6 +14,7 @@
  *   mod  +  t           -> toggle current workspace between tiling and floating
  *   mod  +  shift  + t  -> toggle all workspaces
  *   mod  +  h j k l     -> focus left / down / up / right (respectively) among windows on current tag
+ *   mod  +  shift  + h j k l -> promote nearest window in that direction to master (tiling only)
  *
  */
 
@@ -141,6 +142,10 @@ static void tile_workspace(int ws);
 static void set_workspace_mode(int ws, int mode);
 static void set_mode_for_all(int mode);
 static void focus_in_direction(int dir);
+
+/* new helpers for master promotion */
+static Client *find_neighbor_in_direction(Client *cur, int dir);
+static void promote_to_master(Client *c);
 
 /* --- helpers --- */
 static void die(const char *msg) {
@@ -682,20 +687,12 @@ static void focus_window_at_pointer(void) {
     if (c && c->workspace == current_workspace) focus_client_proper(c);
 }
 
-static void focus_in_direction(int dir) {
-    /* dir:
-       0 -> left
-       1 -> down
-       2 -> up
-       3 -> right
-    */
-
-    if (!clients) return;
-
-    Client *cur = focused;
+/* helper that returns nearest neighbor in given direction, or NULL */
+static Client *find_neighbor_in_direction(Client *cur, int dir) {
+    if (!clients) return NULL;
     if (!cur) {
         for (cur = clients; cur && cur->workspace != current_workspace; cur = cur->next);
-        if (!cur) return;
+        if (!cur) return NULL;
     }
 
     int fx = cur->x + (int)cur->w / 2;
@@ -746,7 +743,57 @@ static void focus_in_direction(int dir) {
         }
     }
 
+    return best;
+}
+
+static void focus_in_direction(int dir) {
+    Client *best = find_neighbor_in_direction(focused, dir);
     if (best) focus_client_proper(best);
+}
+
+/* promote c to be first among its workspace so it becomes master when tiled */
+static void promote_to_master(Client *c) {
+    if (!c) return;
+
+    /* only meaningful if tiled */
+    if (c->workspace < 0 || c->workspace >= MAX_WORKSPACES) return;
+    if (tag_mode[c->workspace] != MODE_TILING) return;
+
+    /* if already the first for that workspace, nothing to do */
+    /* find first client for this workspace */
+    Client *first_same = NULL;
+    for (Client *p = clients; p; p = p->next) {
+        if (p->workspace == c->workspace) { first_same = p; break; }
+    }
+    if (!first_same || first_same == c) {
+        /* either no others or already first */
+        return;
+    }
+
+    /* remove c from list */
+    if (c->prev) c->prev->next = c->next;
+    if (c->next) c->next->prev = c->prev;
+    if (clients == c) clients = c->next;
+
+    /* insert c before first_same */
+    c->next = first_same;
+    c->prev = first_same->prev;
+    first_same->prev = c;
+    if (c->prev) c->prev->next = c;
+    else clients = c;
+
+    /* ensure it's visible / focused / tiled */
+    XRaiseWindow(dpy, c->win);
+    XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
+    focused = c;
+    update_borders();
+
+    /* retile that workspace */
+    tile_workspace(c->workspace);
+
+    /* persist state files */
+    write_focused_workspace_file(current_workspace);
+    write_occupied_workspace_file();
 }
 
 /* --- event handlers --- */
@@ -840,12 +887,31 @@ static void handle_keypress(XEvent *ev) {
         return;
     }
 
-    /* focus with hjkl (both Super and Alt accepted) */
+    /* focus with hjkl (both Super and Alt accepted)
+       if Shift is held, promote nearest in that direction to master (tiling only)
+    */
     if ((state & mod_accept) && (ks == XK_h || ks == XK_j || ks == XK_k || ks == XK_l)) {
-        if (ks == XK_h) { focus_in_direction(0); return; } /* left  */
-        if (ks == XK_j) { focus_in_direction(1); return; } /* down  */
-        if (ks == XK_k) { focus_in_direction(2); return; } /* up    */
-        if (ks == XK_l) { focus_in_direction(3); return; } /* right */
+        int dir = 0;
+        if (ks == XK_h) dir = 0;
+        else if (ks == XK_j) dir = 1;
+        else if (ks == XK_k) dir = 2;
+        else if (ks == XK_l) dir = 3;
+
+        if (ke->state & ShiftMask) {
+            /* promote nearest window in that direction to master (tiling only) */
+            if (!focused) return;
+            Client *cand = find_neighbor_in_direction(focused, dir);
+            if (cand && cand->workspace == current_workspace) {
+                promote_to_master(cand);
+            }
+            return;
+        } else {
+            /* normal focus */
+            if (ks == XK_h) { focus_in_direction(0); return; } /* left  */
+            if (ks == XK_j) { focus_in_direction(1); return; } /* down  */
+            if (ks == XK_k) { focus_in_direction(2); return; } /* up    */
+            if (ks == XK_l) { focus_in_direction(3); return; } /* right */
+        }
     }
 
     /* general mod keys (either Super or Alt) */
