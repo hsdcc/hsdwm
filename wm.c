@@ -1,10 +1,18 @@
 /*
  * hsdwm - floating + per-tag tiling with master layout
  *
- * Behavior:
- *   mod  +  h j k l  or  arrows       -> focus left / down / up / right
- *   mod  +  shift  +  h j k l  or arrows -> swap focused window with neighbor (sway/i3 style)
+ * updated: full rewrite of focusing behavior and tiling focus rules
  *
+ * - focus now prioritizes the window (raises, gives focused border, sets input focus)
+ * - pointer enter / motion and explicit focus movement all call make_priority()
+ * - master/stack focus rules implemented:
+ *     - when in tiling mode:
+ *         - h / left  -> focus master from stack (no-op if already master)
+ *         - l / right -> focus master from stack (no-op if already master)
+ *         - j / down  -> focus next in stack (no-op if focused is master)
+ *         - k / up    -> focus prev in stack (no-op if focused is master)
+ *     - shift + direction will swap focused client with neighbor; focus follows the same
+ *       window (no surprise shifting of focus to a different window)
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -13,14 +21,6 @@
 
 #ifndef BORDER_PX_UNFOCUSED
 #  define BORDER_PX_UNFOCUSED 12
-#endif
-
-#ifndef BORDER_COLOR_FOCUS
-#  define BORDER_COLOR_FOCUS "dodgerblue"
-#endif
-
-#ifndef BORDER_COLOR_UNFOCUS
-#  define BORDER_COLOR_UNFOCUS "gray"
 #endif
 
 #ifndef BORDER_COLOR_FOCUS
@@ -133,7 +133,7 @@ static void focus_in_direction(int dir);
 static Client *find_neighbor_in_direction(Client *cur, int dir);
 static void swap_clients(Client *a, Client *b);
 
-/* --- helpers --- */
+/* helpers */
 static void die(const char *msg) {
     fprintf(stderr, "wm: %s\n", msg);
     exit(EXIT_FAILURE);
@@ -260,9 +260,10 @@ static void update_borders(void) {
             XSetWindowBorderWidth(dpy, c->win, 0);
             continue;
         }
-        if (focused && c->win == focused->win) {
+        if (focused && c == focused) {
             XSetWindowBorderWidth(dpy, c->win, border_focus_width);
             XSetWindowBorder(dpy, c->win, border_focus_col);
+            XRaiseWindow(dpy, c->win);
         } else {
             XSetWindowBorderWidth(dpy, c->win, border_unfocus_width);
             XSetWindowBorder(dpy, c->win, border_unfocus_col);
@@ -644,13 +645,27 @@ static void focus_client_proper(Client *c) {
     write_focused_workspace_file(current_workspace);
 }
 
+/* bring a window to "priority" - raise it, focus it and ensure borders */
+static void make_priority(Client *c) {
+    if (!c) return;
+    if (c->workspace != current_workspace) {
+        /* don't automatically switch workspace here; just ignore */
+    }
+    focused = c;
+    XMapWindow(dpy, c->win);
+    XRaiseWindow(dpy, c->win);
+    XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
+    update_borders();
+    write_focused_workspace_file(current_workspace);
+}
+
 static void focus_window_at_pointer(void) {
     Window ret_root, ret_child;
     int root_x, root_y, win_x, win_y;
     unsigned int mask;
     if (!XQueryPointer(dpy, root, &ret_root, &ret_child, &root_x, &root_y, &win_x, &win_y, &mask)) return;
     Client *c = find_toplevel_client_from_window(ret_child ? ret_child : ret_root);
-    if (c && c->workspace == current_workspace) focus_client_proper(c);
+    if (c && c->workspace == current_workspace) make_priority(c);
 }
 
 /* helper: compute overlap length between [a1,a2) and [b1,b2) */
@@ -666,13 +681,6 @@ static int overlap_len(int a1, int a2, int b1, int b2) {
      1 -> down
      2 -> up
      3 -> right
-
-   algorithm:
-     - prefer candidates that lie in the requested half-plane (by edge).
-     - among those prefer overlapping candidates (on perpendicular axis).
-     - score: primary edge distance (small is better) weighted heavily,
-              plus a small perpendicular distance penalty.
-     - fallback to nearest-center if nothing in half-plane.
 */
 static Client *find_neighbor_in_direction(Client *cur, int dir) {
     if (!clients) return NULL;
@@ -792,7 +800,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
 
 /* swap two nodes in the global clients linked list.
    only swap if both are non-null and in same workspace (safer).
-   keep focused pointer unchanged (focus stays on the same window).
+   after swap, preserve focus on the same window object the user was looking at.
 */
 static void swap_clients(Client *a, Client *b) {
     if (!a || !b || a == b) return;
@@ -802,6 +810,9 @@ static void swap_clients(Client *a, Client *b) {
     Client *a_next = a->next;
     Client *b_prev = b->prev;
     Client *b_next = b->next;
+
+    int a_was_head = (clients == a);
+    int b_was_head = (clients == b);
 
     if (a_next == b) {
         if (a_prev) a_prev->next = b;
@@ -833,14 +844,70 @@ static void swap_clients(Client *a, Client *b) {
         b->next = a_next;
     }
 
-    if (clients == a) clients = b;
-    else if (clients == b) clients = a;
+    if (a_was_head) clients = b;
+    else if (b_was_head) clients = a;
+
+    /* ensure focused still points to the same logical window object
+       and raise it so it remains visually obvious to the user */
+    if (focused == a || focused == b) {
+        /* keep focused as it was (focused points to same struct) */
+        make_priority(focused);
+    }
 }
 
-/* define the missing focus_in_direction wrapper so the prototype isn't unused */
+/* helper: collect clients for a workspace into an array (list order)
+   returns a malloc'd array of Client* and sets out_count; caller must free array
+*/
+static Client **collect_workspace_clients(int ws, int *out_count) {
+    int cnt = 0;
+    for (Client *c = clients; c; c = c->next) if (c->workspace == ws) ++cnt;
+    if (out_count) *out_count = cnt;
+    if (cnt == 0) return NULL;
+    Client **arr = calloc(cnt, sizeof(Client*));
+    int i = 0;
+    for (Client *c = clients; c; c = c->next) if (c->workspace == ws) arr[i++] = c;
+    return arr;
+}
+
+/* define the missing focus_in_direction wrapper with master/stack behavior */
 static void focus_in_direction(int dir) {
-    Client *cand = find_neighbor_in_direction(focused, dir);
-    if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+    if (tag_mode[current_workspace] != MODE_TILING) {
+        /* fallback to geometric neighbor finder */
+        Client *cand = find_neighbor_in_direction(focused, dir);
+        if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+        return;
+    }
+
+    int cnt = 0;
+    Client **arr = collect_workspace_clients(current_workspace, &cnt);
+    if (!arr || cnt == 0) { free(arr); return; }
+
+    Client *master = arr[0];
+    int focused_idx = -1;
+    for (int i = 0; i < cnt; ++i) if (arr[i] == focused) { focused_idx = i; break; }
+
+    /* map: 0 left, 1 down, 2 up, 3 right */
+    if (dir == 0 || dir == 3) {
+        /* left / right => focus master from stack; no-op if focused is master */
+        if (focused_idx <= 0) { /* already master or not found */ free(arr); return; }
+        focus_client_proper(master);
+        free(arr);
+        return;
+    } else if (dir == 1 || dir == 2) {
+        /* down / up => move within stack; if focused is master, no-op */
+        if (focused_idx <= 0) { free(arr); return; }
+        int stack_pos = focused_idx - 1; /* 0 .. stack_count-1 */
+        int stack_count = cnt - 1;
+        if (stack_count <= 0) { free(arr); return; }
+        int new_stack_pos = stack_pos + (dir == 1 ? 1 : -1);
+        if (new_stack_pos < 0 || new_stack_pos >= stack_count) { free(arr); return; }
+        Client *cand = arr[1 + new_stack_pos];
+        if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+        free(arr);
+        return;
+    }
+
+    free(arr);
 }
 
 /* --- event handlers --- */
@@ -870,7 +937,7 @@ static void handle_configurerequest(XEvent *ev) {
 static void handle_enternotify(XEvent *ev) {
     Window w = ev->xcrossing.window;
     Client *c = find_toplevel_client_from_window(w);
-    if (c && c->workspace == current_workspace) focus_client_proper(c);
+    if (c && c->workspace == current_workspace) make_priority(c);
 }
 
 static void handle_motionnotify(XEvent *ev) {
@@ -885,7 +952,7 @@ static void handle_buttonpress(XEvent *ev) {
     Client *c = find_toplevel_client_from_window(clicked);
     if (!c) return;
 
-    focus_client_proper(c);
+    make_priority(c);
 
     if (be->button == Button1) move_client(c, be->x_root, be->y_root, c->x, c->y);
     else if (be->button == Button3) resize_client(c, be->x_root, be->y_root, c->w, c->h);
@@ -938,16 +1005,19 @@ static void handle_keypress(XEvent *ev) {
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
             if (cand && cand->workspace == current_workspace) {
+                /* perform swap and keep focus on the same window struct the user had */
+                Client *old_focused = focused;
                 swap_clients(focused, cand);
+                /* after swapping, make sure the window the user was looking at remains priority */
+                make_priority(old_focused);
                 if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
                 update_borders();
                 write_occupied_workspace_file();
             }
             return;
         } else {
-            /* normal focus movement */
-            Client *cand = find_neighbor_in_direction(focused, dir);
-            if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+            /* normal focus movement using master/stack rules */
+            focus_in_direction(dir);
             return;
         }
     }
