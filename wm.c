@@ -1,18 +1,11 @@
-/*
- * hsdwm - floating + per-tag tiling with master layout
+/* hsdwm - patched: robust dock/panel support + restack fix
  *
- * updated: full rewrite of focusing behavior and tiling focus rules
+ * - docks detected (NET_WM_WINDOW_TYPE_DOCK / _NET_WM_STRUT_PARTIAL)
+ * - docks are workspace = -1, is_dock = 1
+ * - docks get minimal event masks (no Enter/PointerMotion) to avoid stealing focus
+ * - restack_docks() raises docks after other raises (prevents being covered)
+ * - focus / tiling skip dock windows
  *
- * - focus now prioritizes the window (raises, gives focused border, sets input focus)
- * - pointer enter / motion and explicit focus movement all call make_priority()
- * - master/stack focus rules implemented:
- *     - when in tiling mode:
- *         - h / left  -> focus master from stack (no-op if already master)
- *         - l / right -> focus master from stack (no-op if already master)
- *         - j / down  -> focus next in stack (no-op if focused is master)
- *         - k / up    -> focus prev in stack (no-op if focused is master)
- *     - shift + direction will swap focused client with neighbor; focus follows the same
- *       window (no surprise shifting of focus to a different window)
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -82,7 +75,12 @@ typedef struct Client {
     Window win;
     int x, y;
     unsigned int w, h;
-    int workspace;
+    int workspace; /* -1 == global (docks) */
+    int is_dock;
+    unsigned long strut_left;
+    unsigned long strut_right;
+    unsigned long strut_top;
+    unsigned long strut_bottom;
     struct Client *next;
     struct Client *prev;
 } Client;
@@ -104,10 +102,23 @@ static unsigned int border_unfocus_width;
 static Atom ATOM_WM_PROTOCOLS;
 static Atom ATOM_WM_DELETE_WINDOW;
 
+/* ewmh atoms */
+static Atom NET_WM_WINDOW_TYPE;
+static Atom NET_WM_WINDOW_TYPE_DOCK;
+static Atom NET_WM_STRUT_PARTIAL;
+static Atom NET_WM_STATE;
+static Atom NET_WM_STATE_ABOVE;
+
 static int current_workspace = 0;
 static int cycling = 0;
 
 static int tag_mode[MAX_WORKSPACES];
+
+/* reserved area computed from docks */
+static int reserved_top = 0;
+static int reserved_bottom = 0;
+static int reserved_left = 0;
+static int reserved_right = 0;
 
 /* --- prototypes --- */
 static void spawn_program(char *const argv[]);
@@ -133,7 +144,13 @@ static void focus_in_direction(int dir);
 static Client *find_neighbor_in_direction(Client *cur, int dir);
 static void swap_clients(Client *a, Client *b);
 
-/* helpers */
+/* dock helpers */
+static void get_window_type_and_strut(Window w, Client *c);
+static void update_global_struts(void);
+static void set_dock_above_property(Window w);
+static void restack_docks(void);
+
+/* --- helpers --- */
 static void die(const char *msg) {
     fprintf(stderr, "wm: %s\n", msg);
     exit(EXIT_FAILURE);
@@ -253,9 +270,84 @@ static void clamp_size(unsigned int *w, unsigned int *h) {
     if (*h > maxh) *h = maxh;
 }
 
+/* --- dock helpers --- */
+
+static void get_window_type_and_strut(Window w, Client *c) {
+    if (!c) return;
+    c->is_dock = 0;
+    c->strut_left = c->strut_right = c->strut_top = c->strut_bottom = 0;
+
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *prop = NULL;
+
+    /* read _NET_WM_WINDOW_TYPE */
+    if (NET_WM_WINDOW_TYPE != None) {
+        if (XGetWindowProperty(dpy, w, NET_WM_WINDOW_TYPE, 0, 64, False,
+                               XA_ATOM, &actual_type, &actual_format,
+                               &nitems, &bytes_after, &prop) == Success && prop) {
+            Atom *atoms = (Atom *)prop;
+            for (unsigned long i = 0; i < nitems; ++i) {
+                if (atoms[i] == NET_WM_WINDOW_TYPE_DOCK) { c->is_dock = 1; break; }
+            }
+            XFree(prop); prop = NULL;
+        }
+    }
+
+    /* read _NET_WM_STRUT_PARTIAL (12 cardinals) */
+    if (NET_WM_STRUT_PARTIAL != None) {
+        if (XGetWindowProperty(dpy, w, NET_WM_STRUT_PARTIAL, 0, 12, False,
+                               XA_CARDINAL, &actual_type, &actual_format,
+                               &nitems, &bytes_after, &prop) == Success && prop) {
+            unsigned long *vals = (unsigned long *)prop;
+            if (nitems >= 4) {
+                c->strut_left   = vals[0];
+                c->strut_right  = vals[1];
+                c->strut_top    = vals[2];
+                c->strut_bottom = vals[3];
+                if (c->strut_top || c->strut_bottom || c->strut_left || c->strut_right) {
+                    c->is_dock = 1;
+                }
+            }
+            XFree(prop); prop = NULL;
+        }
+    }
+}
+
+static void update_global_struts(void) {
+    reserved_top = reserved_bottom = reserved_left = reserved_right = 0;
+    for (Client *c = clients; c; c = c->next) {
+        if (!c->is_dock) continue;
+        if ((int)c->strut_top > reserved_top) reserved_top = (int)c->strut_top;
+        if ((int)c->strut_bottom > reserved_bottom) reserved_bottom = (int)c->strut_bottom;
+        if ((int)c->strut_left > reserved_left) reserved_left = (int)c->strut_left;
+        if ((int)c->strut_right > reserved_right) reserved_right = (int)c->strut_right;
+    }
+}
+
+static void set_dock_above_property(Window w) {
+    if (NET_WM_STATE == None || NET_WM_STATE_ABOVE == None) return;
+    Atom atoms[1] = { NET_WM_STATE_ABOVE };
+    XChangeProperty(dpy, w, NET_WM_STATE, XA_ATOM, 32, PropModeReplace, (unsigned char *)atoms, 1);
+}
+
+/* raise all docks last so they remain on top */
+static void restack_docks(void) {
+    for (Client *c = clients; c; c = c->next) {
+        if (c->is_dock) {
+            XMapWindow(dpy, c->win);    /* ensure mapped */
+            XRaiseWindow(dpy, c->win);  /* raise dock last */
+        }
+    }
+}
+
 /* --- borders --- */
 static void update_borders(void) {
+    /* first, apply borders / raise focused normal windows */
     for (Client *c = clients; c; c = c->next) {
+        if (c->is_dock) continue; /* skip docks for normal border logic */
+
         if (c->workspace != current_workspace) {
             XSetWindowBorderWidth(dpy, c->win, 0);
             continue;
@@ -269,19 +361,30 @@ static void update_borders(void) {
             XSetWindowBorder(dpy, c->win, border_unfocus_col);
         }
     }
+
+    /* now ensure docks are mapped + on top */
+    restack_docks();
 }
 
 /* --- manage / unmanage --- */
 static void manage(Window w) {
     XWindowAttributes wa;
     if (!XGetWindowAttributes(dpy, w, &wa)) return;
-    if (wa.override_redirect) return;
     if (w == root) return;
 
     Client *c = calloc(1, sizeof(Client));
     if (!c) return;
     c->win = w;
     c->workspace = current_workspace;
+
+    /* detect dock/panel + read strut */
+    get_window_type_and_strut(w, c);
+
+    /* if override-redirect and not a dock -> ignore (like many tooltips) */
+    if (wa.override_redirect && !c->is_dock) {
+        free(c);
+        return;
+    }
 
     if (XGetWindowAttributes(dpy, w, &wa)) {
         c->w = wa.width;
@@ -304,11 +407,33 @@ static void manage(Window w) {
 
     XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
-    XSelectInput(dpy, c->win, EnterWindowMask | FocusChangeMask | PropertyChangeMask | StructureNotifyMask | ButtonPressMask);
+    /* docks get minimal events to avoid focus on Enter/PointerMotion */
+    if (c->is_dock) {
+        XSelectInput(dpy, c->win, ExposureMask | StructureNotifyMask);
+    } else {
+        XSelectInput(dpy, c->win, EnterWindowMask | FocusChangeMask | PropertyChangeMask | StructureNotifyMask | ButtonPressMask);
+    }
 
     add_client_to_list(c);
 
     XSetWMProtocols(dpy, c->win, &ATOM_WM_DELETE_WINDOW, 1);
+
+    if (c->is_dock) {
+        /* docks: visible on all workspaces, don't tile, don't take focus */
+        c->workspace = -1; /* mark as global */
+
+        /* set above state for compositors */
+        set_dock_above_property(c->win);
+
+        /* map and raise dock */
+        XMapWindow(dpy, c->win);
+        XRaiseWindow(dpy, c->win);
+
+        update_global_struts();
+        update_borders();
+        write_occupied_workspace_file();
+        return;
+    }
 
     if (c->workspace == current_workspace) XMapWindow(dpy, c->win);
 
@@ -330,6 +455,9 @@ static void unmanage(Window w) {
     remove_client_from_list(c);
     free(c);
     write_occupied_workspace_file();
+
+    /* recompute reserved areas if a dock was removed */
+    update_global_struts();
 
     if (focused && !find_client(focused->win)) {
         focused = NULL;
@@ -414,17 +542,25 @@ static void tile_workspace(int ws) {
 
     int b = (int)border_unfocus_width;
 
+    /* account for reserved dock areas */
+    int top_reserve = reserved_top;
+    int bottom_reserve = reserved_bottom;
+    int left_reserve = reserved_left;
+    int right_reserve = reserved_right;
+
     int effective_outer = outer_gap + b;
 
-    int avail_w = rw - 2 * effective_outer;
-    int avail_h = rh - 2 * effective_outer;
+    int avail_w = rw - 2 * effective_outer - left_reserve - right_reserve;
+    int avail_h = rh - 2 * effective_outer - top_reserve - bottom_reserve;
     if (avail_w < MIN_WIN_W) avail_w = MIN_WIN_W;
     if (avail_h < MIN_WIN_H) avail_h = MIN_WIN_H;
 
+    int offset_y = top_reserve;
+
     if (count == 1) {
         for (Client *c = clients; c; c = c->next) if (c->workspace == ws) {
-            c->x = effective_outer;
-            c->y = effective_outer;
+            c->x = effective_outer + left_reserve;
+            c->y = effective_outer + offset_y;
             c->w = (unsigned int)(avail_w - 2 * b);
             c->h = (unsigned int)(avail_h - 2 * b);
             XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
@@ -448,16 +584,16 @@ static void tile_workspace(int ws) {
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace != ws) continue;
         if (idx == 0) {
-            c->x = effective_outer;
-            c->y = effective_outer;
+            c->x = effective_outer + left_reserve;
+            c->y = effective_outer + offset_y;
             c->w = (unsigned int)(master_w - 2 * b);
             c->h = (unsigned int)(avail_h - 2 * b);
             XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
         } else {
-            int ny = effective_outer + stack_idx * (stack_each_h + inner_gap);
+            int ny = effective_outer + offset_y + stack_idx * (stack_each_h + inner_gap);
             int nh = (stack_idx == stack_count - 1) ? (avail_h - (stack_each_h + inner_gap) * (stack_count - 1)) : stack_each_h;
 
-            c->x = effective_outer + master_w + inner_gap;
+            c->x = effective_outer + left_reserve + master_w + inner_gap;
             c->y = ny;
             c->w = (unsigned int)(stack_w - 2 * b);
             c->h = (unsigned int)(nh - 2 * b);
@@ -467,6 +603,8 @@ static void tile_workspace(int ws) {
         ++idx;
     }
 }
+
+/* --- workspace / focus helpers (master/stack rules kept) --- */
 
 static void set_workspace_mode(int ws, int mode) {
     if (ws < 0 || ws >= MAX_WORKSPACES) return;
@@ -481,14 +619,13 @@ static void set_mode_for_all(int mode) {
     }
 }
 
-/* --- workspaces --- */
 static void switch_workspace(int ws) {
     if (ws < 0 || ws >= MAX_WORKSPACES) return;
     if (ws == current_workspace) return;
     current_workspace = ws;
 
     for (Client *c = clients; c; c = c->next) {
-        if (c->workspace == current_workspace) XMapWindow(dpy, c->win);
+        if (c->workspace == current_workspace || c->workspace == -1) XMapWindow(dpy, c->win);
         else XUnmapWindow(dpy, c->win);
     }
 
@@ -641,14 +778,14 @@ static void focus_client_proper(Client *c) {
     focused = c;
     XRaiseWindow(dpy, c->win);
     XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
-    update_borders();
+    update_borders(); /* will restack docks after raising focused window */
     write_focused_workspace_file(current_workspace);
 }
 
 /* bring a window to "priority" - raise it, focus it and ensure borders */
 static void make_priority(Client *c) {
     if (!c) return;
-    if (c->workspace != current_workspace) {
+    if (c->workspace != current_workspace && c->workspace != -1) {
         /* don't automatically switch workspace here; just ignore */
     }
     focused = c;
@@ -665,6 +802,9 @@ static void focus_window_at_pointer(void) {
     unsigned int mask;
     if (!XQueryPointer(dpy, root, &ret_root, &ret_child, &root_x, &root_y, &win_x, &win_y, &mask)) return;
     Client *c = find_toplevel_client_from_window(ret_child ? ret_child : ret_root);
+    if (!c) return;
+    /* don't focus docks on pointer enter */
+    if (c->is_dock) return;
     if (c && c->workspace == current_workspace) make_priority(c);
 }
 
@@ -675,17 +815,10 @@ static int overlap_len(int a1, int a2, int b1, int b2) {
     return (hi > lo) ? (hi - lo) : 0;
 }
 
-/* --- improved directional finder (sway/i3-like) ---
-   dir:
-     0 -> left
-     1 -> down
-     2 -> up
-     3 -> right
-*/
+/* --- improved directional finder (sway/i3-like) --- (same as before) */
 static Client *find_neighbor_in_direction(Client *cur, int dir) {
     if (!clients) return NULL;
 
-    /* pick a start focused client on current workspace */
     Client *start = cur;
     if (!start || start->workspace != current_workspace) {
         for (start = clients; start && start->workspace != current_workspace; start = start->next);
@@ -707,6 +840,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace != current_workspace) continue;
         if (c == cur) continue;
+        if (c->is_dock) continue;
 
         int ax1 = c->x;
         int ay1 = c->y;
@@ -720,7 +854,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
         long long primary = 0;
         long long secondary = 0;
 
-        if (dir == 0) { /* left: candidate should be to the left */
+        if (dir == 0) {
             overlap_perp = overlap_len(ay1, ay2, cy1, cy2);
             if (ax2 <= cx1) {
                 in_dir = 1;
@@ -733,7 +867,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = (long long)abs(acx - ccx);
             }
             secondary = overlap_perp > 0 ? 0 : (long long)abs(acy - ccy);
-        } else if (dir == 3) { /* right */
+        } else if (dir == 3) {
             overlap_perp = overlap_len(ay1, ay2, cy1, cy2);
             if (ax1 >= cx2) {
                 in_dir = 1;
@@ -746,7 +880,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = (long long)abs(acx - ccx);
             }
             secondary = overlap_perp > 0 ? 0 : (long long)abs(acy - ccy);
-        } else if (dir == 2) { /* up */
+        } else if (dir == 2) {
             overlap_perp = overlap_len(ax1, ax2, cx1, cx2);
             if (ay2 <= cy1) {
                 in_dir = 1;
@@ -759,7 +893,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = (long long)abs(acy - ccy);
             }
             secondary = overlap_perp > 0 ? 0 : (long long)abs(acx - ccx);
-        } else { /* down */
+        } else {
             overlap_perp = overlap_len(ax1, ax2, cx1, cx2);
             if (ay1 >= cy2) {
                 in_dir = 1;
@@ -798,10 +932,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
     return best;
 }
 
-/* swap two nodes in the global clients linked list.
-   only swap if both are non-null and in same workspace (safer).
-   after swap, preserve focus on the same window object the user was looking at.
-*/
+/* swap two nodes... (same as before) */
 static void swap_clients(Client *a, Client *b) {
     if (!a || !b || a == b) return;
     if (a->workspace != b->workspace) return;
@@ -847,17 +978,12 @@ static void swap_clients(Client *a, Client *b) {
     if (a_was_head) clients = b;
     else if (b_was_head) clients = a;
 
-    /* ensure focused still points to the same logical window object
-       and raise it so it remains visually obvious to the user */
     if (focused == a || focused == b) {
-        /* keep focused as it was (focused points to same struct) */
         make_priority(focused);
     }
 }
 
-/* helper: collect clients for a workspace into an array (list order)
-   returns a malloc'd array of Client* and sets out_count; caller must free array
-*/
+/* helper: collect clients for a workspace into an array */
 static Client **collect_workspace_clients(int ws, int *out_count) {
     int cnt = 0;
     for (Client *c = clients; c; c = c->next) if (c->workspace == ws) ++cnt;
@@ -869,10 +995,9 @@ static Client **collect_workspace_clients(int ws, int *out_count) {
     return arr;
 }
 
-/* define the missing focus_in_direction wrapper with master/stack behavior */
+/* focus_in_direction with master/stack behavior (same logic as before) */
 static void focus_in_direction(int dir) {
     if (tag_mode[current_workspace] != MODE_TILING) {
-        /* fallback to geometric neighbor finder */
         Client *cand = find_neighbor_in_direction(focused, dir);
         if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
         return;
@@ -886,17 +1011,14 @@ static void focus_in_direction(int dir) {
     int focused_idx = -1;
     for (int i = 0; i < cnt; ++i) if (arr[i] == focused) { focused_idx = i; break; }
 
-    /* map: 0 left, 1 down, 2 up, 3 right */
     if (dir == 0 || dir == 3) {
-        /* left / right => focus master from stack; no-op if focused is master */
-        if (focused_idx <= 0) { /* already master or not found */ free(arr); return; }
+        if (focused_idx <= 0) { free(arr); return; }
         focus_client_proper(master);
         free(arr);
         return;
     } else if (dir == 1 || dir == 2) {
-        /* down / up => move within stack; if focused is master, no-op */
         if (focused_idx <= 0) { free(arr); return; }
-        int stack_pos = focused_idx - 1; /* 0 .. stack_count-1 */
+        int stack_pos = focused_idx - 1;
         int stack_count = cnt - 1;
         if (stack_count <= 0) { free(arr); return; }
         int new_stack_pos = stack_pos + (dir == 1 ? 1 : -1);
@@ -937,7 +1059,7 @@ static void handle_configurerequest(XEvent *ev) {
 static void handle_enternotify(XEvent *ev) {
     Window w = ev->xcrossing.window;
     Client *c = find_toplevel_client_from_window(w);
-    if (c && c->workspace == current_workspace) make_priority(c);
+    if (c && c->workspace == current_workspace && !c->is_dock) make_priority(c);
 }
 
 static void handle_motionnotify(XEvent *ev) {
@@ -951,6 +1073,12 @@ static void handle_buttonpress(XEvent *ev) {
     if (!clicked) return;
     Client *c = find_toplevel_client_from_window(clicked);
     if (!c) return;
+
+    /* ignore clicks on docks if you want bar to be click-through; currently we give docks priority */
+    if (c->is_dock) {
+        /* optionally ignore clicks by returning here */
+        /* return; */
+    }
 
     make_priority(c);
 
@@ -1001,14 +1129,11 @@ static void handle_keypress(XEvent *ev) {
 
     if ((state & mod_accept) && dir != -1) {
         if (ke->state & ShiftMask) {
-            /* swap focused with neighbor in that direction (sway-like) */
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
             if (cand && cand->workspace == current_workspace) {
-                /* perform swap and keep focus on the same window struct the user had */
                 Client *old_focused = focused;
                 swap_clients(focused, cand);
-                /* after swapping, make sure the window the user was looking at remains priority */
                 make_priority(old_focused);
                 if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
                 update_borders();
@@ -1016,7 +1141,6 @@ static void handle_keypress(XEvent *ev) {
             }
             return;
         } else {
-            /* normal focus movement using master/stack rules */
             focus_in_direction(dir);
             return;
         }
@@ -1075,7 +1199,7 @@ static void scan_existing_windows(void) {
         for (unsigned int i = 0; i < nchildren; ++i) {
             Window w = children[i];
             XWindowAttributes wa;
-            if (XGetWindowAttributes(dpy, w, &wa) && !wa.override_redirect) manage(w);
+            if (XGetWindowAttributes(dpy, w, &wa)) manage(w);
         }
         if (children) XFree(children);
     }
@@ -1156,6 +1280,13 @@ int main(void) {
     ATOM_WM_PROTOCOLS      = XInternAtom(dpy, "WM_PROTOCOLS", False);
     ATOM_WM_DELETE_WINDOW  = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
 
+    /* intern atoms for docks/struts */
+    NET_WM_WINDOW_TYPE      = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    NET_WM_WINDOW_TYPE_DOCK = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    NET_WM_STRUT_PARTIAL    = XInternAtom(dpy, "_NET_WM_STRUT_PARTIAL", False);
+    NET_WM_STATE            = XInternAtom(dpy, "_NET_WM_STATE", False);
+    NET_WM_STATE_ABOVE      = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+
     border_focus_col   = alloc_color(BORDER_COLOR_FOCUS);
     border_unfocus_col = alloc_color(BORDER_COLOR_UNFOCUS);
     border_focus_width = BORDER_PX_FOCUSED;
@@ -1174,6 +1305,9 @@ int main(void) {
     run_autolaunch();
 
     scan_existing_windows();
+
+    /* compute reserved areas from any existing bars */
+    update_global_struts();
 
     for (int i = 0; i < MAX_WORKSPACES; ++i) if (tag_mode[i] == MODE_TILING) tile_workspace(i);
 
