@@ -932,7 +932,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
     return best;
 }
 
-/* swap two nodes... (same as before) */
+/* swap two nodes... (removed forced focus at end: caller decides focus) */
 static void swap_clients(Client *a, Client *b) {
     if (!a || !b || a == b) return;
     if (a->workspace != b->workspace) return;
@@ -978,9 +978,7 @@ static void swap_clients(Client *a, Client *b) {
     if (a_was_head) clients = b;
     else if (b_was_head) clients = a;
 
-    if (focused == a || focused == b) {
-        make_priority(focused);
-    }
+    /* note: no focus side-effect here; caller should call make_priority() if needed */
 }
 
 /* helper: collect clients for a workspace into an array */
@@ -1142,7 +1140,6 @@ static void handle_keypress(XEvent *ev) {
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
             if (cand && cand->workspace == current_workspace) {
-                Client *old_focused = focused;
                 swap_clients(focused, cand);
                 /* focus should follow the window that moved into the master's spot */
                 make_priority(cand);
