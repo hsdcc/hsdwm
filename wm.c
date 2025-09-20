@@ -1012,10 +1012,20 @@ static void focus_in_direction(int dir) {
     for (int i = 0; i < cnt; ++i) if (arr[i] == focused) { focused_idx = i; break; }
 
     if (dir == 0 || dir == 3) {
-        if (focused_idx <= 0) { free(arr); return; }
-        focus_client_proper(master);
-        free(arr);
-        return;
+        if (focused_idx <= 0) {
+            /* master focused (or no focus) -> focus first stack client if present */
+            if (cnt > 1) {
+                Client *cand = arr[1];
+                if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+            }
+            free(arr);
+            return;
+        } else {
+            /* a stack client is focused -> focus master */
+            focus_client_proper(master);
+            free(arr);
+            return;
+        }
     } else if (dir == 1 || dir == 2) {
         if (focused_idx <= 0) { free(arr); return; }
         int stack_pos = focused_idx - 1;
@@ -1134,7 +1144,8 @@ static void handle_keypress(XEvent *ev) {
             if (cand && cand->workspace == current_workspace) {
                 Client *old_focused = focused;
                 swap_clients(focused, cand);
-                make_priority(old_focused);
+                /* focus should follow the window that moved into the master's spot */
+                make_priority(cand);
                 if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
                 update_borders();
                 write_occupied_workspace_file();
