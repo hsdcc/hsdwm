@@ -56,6 +56,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/wait.h>
+
 
 /* --- constants --- */
 #define MOVE_CURSOR    XC_fleur
@@ -139,6 +142,12 @@ static void tile_workspace(int ws);
 static void set_workspace_mode(int ws, int mode);
 static void set_mode_for_all(int mode);
 static void focus_in_direction(int dir);
+
+static void sigchld_handler(int sig) {
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+}
+
 
 /* new: improved neighbor finder + swap */
 static Client *find_neighbor_in_direction(Client *cur, int dir);
@@ -1277,9 +1286,14 @@ static void toggle_fullscreen(Client *c) {
 
 /* --- startup --- */
 int main(void) {
+    struct sigaction sa;
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+
     dpy = XOpenDisplay(NULL);
     if (!dpy) die("cannot open display");
-
     XSetErrorHandler(xerror_handler);
 
     screen_num = DefaultScreen(dpy);
