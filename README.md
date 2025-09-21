@@ -1,8 +1,5 @@
 # hsdwm
 itsy bitsy x11 window manager
-# hsdwm
----
-
 ## features
 
 - floating + tiling (per workspace)
