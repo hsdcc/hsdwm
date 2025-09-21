@@ -6,17 +6,12 @@
  * - restack_docks() raises docks after other raises (prevents being covered)
  * - focus / tiling skip dock windows
  *
- * Fixes / improvements:
- *  - robust swap + focus behavior: when user swaps focused window with neighbor
- *    (Super + Shift + dir), focus reliably remains on the window the user moved.
- *    This uses XGrabServer + XSync to avoid races, runs tiling & border updates
- *    before finalizing focus, and guarantees the focus assignment is the last
- *    visual action performed.
+ *  - simplified gap configuration: gap_outer and gap_inner only
+ *  - swap_clients_keep_focus to keep focus on the moved window after swapping master/stack
  *
- *  - additional guards in the swap handler for NULL / dock / workspace mismatch.
+ * Edit gap_outer and gap_inner near the top to configure layout gaps.
  *
- * Note: this file is a single-file WM. compile with:
- *   gcc -O2 -std=c11 -Wall -Wextra -o hsdwm hsdwm.c -lX11 -lXft -lfontconfig -lm
+ *
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -47,10 +42,6 @@
 #  define DEFAULT_MASTER_FACTOR 60  /* percent width for master area */
 #endif
 
-#ifndef DEFAULT_GAP
-#  define DEFAULT_GAP 8
-#endif
-
 #define _POSIX_C_SOURCE 200809L
 
 #include <X11/Xlib.h>
@@ -69,7 +60,6 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <limits.h>
 
 /* --- constants --- */
 #define MOVE_CURSOR    XC_fleur
@@ -80,6 +70,10 @@
 
 static char *term_cmd[]  = { "xterm", NULL };
 static char *dmenu_cmd[] = { "dmenu_run", NULL };
+
+/* --- gap configuration (edit before compile) --- */
+static int gap_outer = 24;   /* outer gap on both sides */
+static int gap_inner = 8;   /* gap between master and stack */
 
 /* --- modes --- */
 enum { MODE_FLOATING = 0, MODE_TILING = 1 };
@@ -556,9 +550,8 @@ static void tile_workspace(int ws) {
     int rw = DisplayWidth(dpy, screen_num);
     int rh = DisplayHeight(dpy, screen_num);
 
-    int gap = DEFAULT_GAP;
-    int outer_gap = gap;
-    int inner_gap = gap;
+    int outer_gap = gap_outer;
+    int inner_gap = gap_inner;
 
     int b = (int)border_unfocus_width;
 
@@ -568,6 +561,7 @@ static void tile_workspace(int ws) {
     int left_reserve = reserved_left;
     int right_reserve = reserved_right;
 
+    /* effective outer gap includes border thickness to avoid overlap */
     int effective_outer = outer_gap + b;
 
     int avail_w = rw - 2 * effective_outer - left_reserve - right_reserve;
@@ -575,14 +569,16 @@ static void tile_workspace(int ws) {
     if (avail_w < MIN_WIN_W) avail_w = MIN_WIN_W;
     if (avail_h < MIN_WIN_H) avail_h = MIN_WIN_H;
 
-    int offset_y = top_reserve;
+    int origin_x = effective_outer + left_reserve;
+    int origin_y = effective_outer + top_reserve;
 
     if (count == 1) {
         for (Client *c = clients; c; c = c->next) if (c->workspace == ws) {
-            c->x = effective_outer + left_reserve;
-            c->y = effective_outer + offset_y;
+            c->x = origin_x;
+            c->y = origin_y;
             c->w = (unsigned int)(avail_w - 2 * b);
             c->h = (unsigned int)(avail_h - 2 * b);
+            clamp_size(&c->w, &c->h);
             XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
         }
         return;
@@ -592,6 +588,9 @@ static void tile_workspace(int ws) {
     if (master_w < MIN_WIN_W) master_w = MIN_WIN_W;
 
     int stack_w = avail_w - master_w - inner_gap;
+    if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
+
+    /* fix for MIN_WIN_W constant usage: ensure stack_w not absurd */
     if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
 
     int idx = 0;
@@ -604,19 +603,21 @@ static void tile_workspace(int ws) {
     for (Client *c = clients; c; c = c->next) {
         if (c->workspace != ws) continue;
         if (idx == 0) {
-            c->x = effective_outer + left_reserve;
-            c->y = effective_outer + offset_y;
+            c->x = origin_x;
+            c->y = origin_y;
             c->w = (unsigned int)(master_w - 2 * b);
             c->h = (unsigned int)(avail_h - 2 * b);
+            clamp_size(&c->w, &c->h);
             XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
         } else {
-            int ny = effective_outer + offset_y + stack_idx * (stack_each_h + inner_gap);
+            int ny = origin_y + stack_idx * (stack_each_h + inner_gap);
             int nh = (stack_idx == stack_count - 1) ? (avail_h - (stack_each_h + inner_gap) * (stack_count - 1)) : stack_each_h;
 
-            c->x = effective_outer + left_reserve + master_w + inner_gap;
+            c->x = origin_x + master_w + inner_gap;
             c->y = ny;
             c->w = (unsigned int)(stack_w - 2 * b);
             c->h = (unsigned int)(nh - 2 * b);
+            clamp_size(&c->w, &c->h);
             XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
             ++stack_idx;
         }
@@ -835,7 +836,7 @@ static int overlap_len(int a1, int a2, int b1, int b2) {
     return (hi > lo) ? (hi - lo) : 0;
 }
 
-/* --- improved directional finder (sway/i3-like) --- (same as before) */
+/* --- improved directional finder (sway/i3-like) --- */
 static Client *find_neighbor_in_direction(Client *cur, int dir) {
     if (!clients) return NULL;
 
@@ -1007,7 +1008,7 @@ static void swap_clients(Client *a, Client *b) {
 }
 
 /* swap helper that grabs server, retile, update borders, then focuses the moved client
- * This ensures the focus assignment is the last visible operation and reduces races.
+ * This reduces race conditions where focus ends up on the wrong window.
  */
 static void swap_clients_keep_focus(Client *a, Client *b) {
     if (!a || !b) return;
@@ -1018,29 +1019,20 @@ static void swap_clients_keep_focus(Client *a, Client *b) {
     /* we want focus to stay on 'a' (the client the user moved). store it. */
     Client *moved = a;
 
-    /* grab server to avoid other clients interfering while we swap & retile */
     XGrabServer(dpy);
 
-    /* perform swap in list */
     swap_clients(a, b);
 
-    /* retile the workspace (layout changes may update sizes/positions) */
     if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
 
-    /* update reserved areas, borders, docks stacking */
     update_global_struts();
     update_borders();
-
-    /* refresh occupied file */
     write_occupied_workspace_file();
 
-    /* ensure X server processes all pending ops so focus application comes last */
     XSync(dpy, False);
 
-    /* now focus the moved client explicitly and raise it last */
     focus_client_proper(moved);
 
-    /* final sync and release */
     XSync(dpy, False);
     XUngrabServer(dpy);
 }
@@ -1057,7 +1049,7 @@ static Client **collect_workspace_clients(int ws, int *out_count) {
     return arr;
 }
 
-/* focus_in_direction with master/stack behavior (same logic as before) */
+/* focus_in_direction with master/stack behavior */
 static void focus_in_direction(int dir) {
     if (tag_mode[current_workspace] != MODE_TILING) {
         Client *cand = find_neighbor_in_direction(focused, dir);
@@ -1075,7 +1067,6 @@ static void focus_in_direction(int dir) {
 
     if (dir == 0 || dir == 3) {
         if (focused_idx <= 0) {
-            /* master focused (or no focus) -> focus first stack client if present */
             if (cnt > 1) {
                 Client *cand = arr[1];
                 if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
@@ -1083,7 +1074,6 @@ static void focus_in_direction(int dir) {
             free(arr);
             return;
         } else {
-            /* a stack client is focused -> focus master */
             focus_client_proper(master);
             free(arr);
             return;
@@ -1146,7 +1136,6 @@ static void handle_buttonpress(XEvent *ev) {
     Client *c = find_toplevel_client_from_window(clicked);
     if (!c) return;
 
-    /* ignore clicks on docks if you want bar to be click-through; currently we give docks priority */
     if (c->is_dock) {
         /* optionally ignore clicks by returning here */
         /* return; */
@@ -1204,7 +1193,6 @@ static void handle_keypress(XEvent *ev) {
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
             if (cand && cand->workspace == current_workspace && !cand->is_dock) {
-                /* swap focused with cand but keep focus on the window the user moved (focused) */
                 swap_clients_keep_focus(focused, cand);
             }
             return;

@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -O2
-LIBS = -lX11 -lxkbfile
+CFLAGS = -Wall -O2 -std=c11 -Wextra
+LIBS = -lX11 -lxkbfile -lXft -lfontconfig -lm
 
 all: thing
 
