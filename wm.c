@@ -6,10 +6,17 @@
  * - restack_docks() raises docks after other raises (prevents being covered)
  * - focus / tiling skip dock windows
  *
- *        ensure focus remains on the window the user moved when swapping.
- *        i.e. when user presses Super + Shift + dir to swap focused with neighbor,
- *        the focused window stays focused after the swap (it simply moved).
+ * Fixes / improvements:
+ *  - robust swap + focus behavior: when user swaps focused window with neighbor
+ *    (Super + Shift + dir), focus reliably remains on the window the user moved.
+ *    This uses XGrabServer + XSync to avoid races, runs tiling & border updates
+ *    before finalizing focus, and guarantees the focus assignment is the last
+ *    visual action performed.
  *
+ *  - additional guards in the swap handler for NULL / dock / workspace mismatch.
+ *
+ * Note: this file is a single-file WM. compile with:
+ *   gcc -O2 -std=c11 -Wall -Wextra -o hsdwm hsdwm.c -lX11 -lXft -lfontconfig -lm
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -62,7 +69,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
-
+#include <limits.h>
 
 /* --- constants --- */
 #define MOVE_CURSOR    XC_fleur
@@ -152,10 +159,10 @@ static void sigchld_handler(int sig) {
     while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 
-
 /* new: improved neighbor finder + swap */
 static Client *find_neighbor_in_direction(Client *cur, int dir);
 static void swap_clients(Client *a, Client *b);
+static void swap_clients_keep_focus(Client *a, Client *b); /* new helper */
 
 /* dock helpers */
 static void get_window_type_and_strut(Window w, Client *c);
@@ -877,9 +884,9 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = 0;
             } else {
                 in_dir = 0;
-                primary = (long long)abs(acx - ccx);
+                primary = (long long)llabs((long long)acx - (long long)ccx);
             }
-            secondary = overlap_perp > 0 ? 0 : (long long)abs(acy - ccy);
+            secondary = overlap_perp > 0 ? 0 : (long long)llabs((long long)acy - (long long)ccy);
         } else if (dir == 3) {
             overlap_perp = overlap_len(ay1, ay2, cy1, cy2);
             if (ax1 >= cx2) {
@@ -890,9 +897,9 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = 0;
             } else {
                 in_dir = 0;
-                primary = (long long)abs(acx - ccx);
+                primary = (long long)llabs((long long)acx - (long long)ccx);
             }
-            secondary = overlap_perp > 0 ? 0 : (long long)abs(acy - ccy);
+            secondary = overlap_perp > 0 ? 0 : (long long)llabs((long long)acy - (long long)ccy);
         } else if (dir == 2) {
             overlap_perp = overlap_len(ax1, ax2, cx1, cx2);
             if (ay2 <= cy1) {
@@ -903,9 +910,9 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = 0;
             } else {
                 in_dir = 0;
-                primary = (long long)abs(acy - ccy);
+                primary = (long long)llabs((long long)acy - (long long)ccy);
             }
-            secondary = overlap_perp > 0 ? 0 : (long long)abs(acx - ccx);
+            secondary = overlap_perp > 0 ? 0 : (long long)llabs((long long)acx - (long long)ccx);
         } else {
             overlap_perp = overlap_len(ax1, ax2, cx1, cx2);
             if (ay1 >= cy2) {
@@ -916,9 +923,9 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
                 primary = 0;
             } else {
                 in_dir = 0;
-                primary = (long long)abs(acy - ccy);
+                primary = (long long)llabs((long long)acy - (long long)ccy);
             }
-            secondary = overlap_perp > 0 ? 0 : (long long)abs(acx - ccx);
+            secondary = overlap_perp > 0 ? 0 : (long long)llabs((long long)acx - (long long)ccx);
         }
 
         long long score = primary * 100000LL + secondary * 100LL;
@@ -997,6 +1004,45 @@ static void swap_clients(Client *a, Client *b) {
     /* NO focus change here. Caller must call make_priority() or focus_client_proper()
      * on the client that should remain focused after the swap.
      */
+}
+
+/* swap helper that grabs server, retile, update borders, then focuses the moved client
+ * This ensures the focus assignment is the last visible operation and reduces races.
+ */
+static void swap_clients_keep_focus(Client *a, Client *b) {
+    if (!a || !b) return;
+    if (a == b) return;
+    if (a->workspace != b->workspace) return;
+    if (a->is_dock || b->is_dock) return;
+
+    /* we want focus to stay on 'a' (the client the user moved). store it. */
+    Client *moved = a;
+
+    /* grab server to avoid other clients interfering while we swap & retile */
+    XGrabServer(dpy);
+
+    /* perform swap in list */
+    swap_clients(a, b);
+
+    /* retile the workspace (layout changes may update sizes/positions) */
+    if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
+
+    /* update reserved areas, borders, docks stacking */
+    update_global_struts();
+    update_borders();
+
+    /* refresh occupied file */
+    write_occupied_workspace_file();
+
+    /* ensure X server processes all pending ops so focus application comes last */
+    XSync(dpy, False);
+
+    /* now focus the moved client explicitly and raise it last */
+    focus_client_proper(moved);
+
+    /* final sync and release */
+    XSync(dpy, False);
+    XUngrabServer(dpy);
 }
 
 /* helper: collect clients for a workspace into an array */
@@ -1157,16 +1203,9 @@ static void handle_keypress(XEvent *ev) {
         if (ke->state & ShiftMask) {
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
-            if (cand && cand->workspace == current_workspace) {
-                /* swap focused with cand */
-                swap_clients(focused, cand);
-
-                /* ensure focus stays on the window the user moved (focused) */
-                make_priority(focused);
-
-                if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
-                update_borders();
-                write_occupied_workspace_file();
+            if (cand && cand->workspace == current_workspace && !cand->is_dock) {
+                /* swap focused with cand but keep focus on the window the user moved (focused) */
+                swap_clients_keep_focus(focused, cand);
             }
             return;
         } else {
