@@ -35,3 +35,5 @@ edit #define values at the top of wm.c for:
 ---
 
 ![preview](.examples/preview.png)
+![preview](.examples/previewtiling.png)
+
