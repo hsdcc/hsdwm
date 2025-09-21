@@ -6,6 +6,10 @@
  * - restack_docks() raises docks after other raises (prevents being covered)
  * - focus / tiling skip dock windows
  *
+ *        ensure focus remains on the window the user moved when swapping.
+ *        i.e. when user presses Super + Shift + dir to swap focused with neighbor,
+ *        the focused window stays focused after the swap (it simply moved).
+ *
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -941,7 +945,7 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
     return best;
 }
 
-/* swap two nodes... (removed forced focus at end: caller decides focus) */
+/* swap two nodes... (no focus side-effect here: caller decides focus) */
 static void swap_clients(Client *a, Client *b) {
     if (!a || !b || a == b) return;
     if (a->workspace != b->workspace) return;
@@ -955,6 +959,7 @@ static void swap_clients(Client *a, Client *b) {
     int b_was_head = (clients == b);
 
     if (a_next == b) {
+        /* a immediately before b */
         if (a_prev) a_prev->next = b;
         b->prev = a_prev;
 
@@ -964,6 +969,7 @@ static void swap_clients(Client *a, Client *b) {
         b->next = a;
         a->prev = b;
     } else if (b_next == a) {
+        /* b immediately before a */
         if (b_prev) b_prev->next = a;
         a->prev = b_prev;
 
@@ -973,6 +979,7 @@ static void swap_clients(Client *a, Client *b) {
         a->next = b;
         b->prev = a;
     } else {
+        /* non-adjacent */
         if (a_prev) a_prev->next = b;
         if (a_next) a_next->prev = b;
         if (b_prev) b_prev->next = a;
@@ -987,7 +994,9 @@ static void swap_clients(Client *a, Client *b) {
     if (a_was_head) clients = b;
     else if (b_was_head) clients = a;
 
-    /* note: no focus side-effect here; caller should call make_priority() if needed */
+    /* NO focus change here. Caller must call make_priority() or focus_client_proper()
+     * on the client that should remain focused after the swap.
+     */
 }
 
 /* helper: collect clients for a workspace into an array */
@@ -1149,9 +1158,12 @@ static void handle_keypress(XEvent *ev) {
             if (!focused) return;
             Client *cand = find_neighbor_in_direction(focused, dir);
             if (cand && cand->workspace == current_workspace) {
+                /* swap focused with cand */
                 swap_clients(focused, cand);
-                /* focus should follow the window that moved into the master's spot */
-                make_priority(cand);
+
+                /* ensure focus stays on the window the user moved (focused) */
+                make_priority(focused);
+
                 if (tag_mode[current_workspace] == MODE_TILING) tile_workspace(current_workspace);
                 update_borders();
                 write_occupied_workspace_file();
