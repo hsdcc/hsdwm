@@ -1,10 +1,6 @@
 # hsdwm
 itsy bitsy x11 window manager
-```
 # hsdwm
-
-hsdwm — tiny, dumb, but functional X11 window manager with docks/panels, tiling + floating modes, gaps, borders, and directional focus. made for people who hate bloated WMs but still want some i3-ish sanity.
-
 ---
 
 ## features
@@ -40,6 +36,5 @@ edit #define values at the top of wm.c for:
 - terminal/dmenu commands
 
 ---
-```
 
 ![preview](.examples/preview.png)
