@@ -1,4 +1,4 @@
-/* hsdwm - patched: robust dock/panel support + restack fix
+/* hsdwm shitty dock/panel support + restack fix
  *
  * - docks detected (NET_WM_WINDOW_TYPE_DOCK / _NET_WM_STRUT_PARTIAL)
  * - docks are workspace = -1, is_dock = 1
