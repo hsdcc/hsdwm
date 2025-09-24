@@ -1,17 +1,14 @@
-/* hsdwm shitty dock/panel support + restack fix
+/* hsdwm — dock handling tightened: full STRUT_PARTIAL support, prevent moves/resizes,
+ * property watching and reapply geometry on changes.
  *
- * - docks detected (NET_WM_WINDOW_TYPE_DOCK / _NET_WM_STRUT_PARTIAL)
+ * - docks detected (NET_WM_WINDOW_TYPE_DOCK / _NET_WM_STRUT_PARTIAL 12 cardinals)
  * - docks are workspace = -1, is_dock = 1
- * - docks get minimal event masks (no Enter/PointerMotion) to avoid stealing focus
+ * - docks get minimal event masks (no Enter/PointerMotion) and PropertyChangeMask
  * - restack_docks() raises docks after other raises (prevents being covered)
  * - focus / tiling skip dock windows
- *
- *  - simplified gap configuration: gap_outer and gap_inner only
- *  - swap_clients_keep_focus to keep focus on the moved window after swapping master/stack
+ * - docks cannot be moved/resized by pointer or configure requests
  *
  * Edit gap_outer and gap_inner near the top to configure layout gaps.
- *
- *
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -85,10 +82,20 @@ typedef struct Client {
     unsigned int w, h;
     int workspace; /* -1 == global (docks) */
     int is_dock;
+    /* primary 4 struts */
     unsigned long strut_left;
     unsigned long strut_right;
     unsigned long strut_top;
     unsigned long strut_bottom;
+    /* extended partial fields (12-cardinals) */
+    unsigned long strut_left_start_y;
+    unsigned long strut_left_end_y;
+    unsigned long strut_right_start_y;
+    unsigned long strut_right_end_y;
+    unsigned long strut_top_start_x;
+    unsigned long strut_top_end_x;
+    unsigned long strut_bottom_start_x;
+    unsigned long strut_bottom_end_x;
     struct Client *next;
     struct Client *prev;
 } Client;
@@ -163,6 +170,8 @@ static void get_window_type_and_strut(Window w, Client *c);
 static void update_global_struts(void);
 static void set_dock_above_property(Window w);
 static void restack_docks(void);
+static void apply_dock_geometry(Client *c); /* compute & enforce geometry from strut */
+static void handle_propertynotify(XEvent *ev);
 
 /* --- helpers --- */
 static void die(const char *msg) {
@@ -286,10 +295,17 @@ static void clamp_size(unsigned int *w, unsigned int *h) {
 
 /* --- dock helpers --- */
 
+/* Read window type and full strut partial (12 cardinals).
+ * Fills extended strut fields; sets c->is_dock if appropriate.
+ */
 static void get_window_type_and_strut(Window w, Client *c) {
     if (!c) return;
     c->is_dock = 0;
     c->strut_left = c->strut_right = c->strut_top = c->strut_bottom = 0;
+    c->strut_left_start_y = c->strut_left_end_y = 0;
+    c->strut_right_start_y = c->strut_right_end_y = 0;
+    c->strut_top_start_x = c->strut_top_end_x = 0;
+    c->strut_bottom_start_x = c->strut_bottom_end_x = 0;
 
     Atom actual_type = None;
     int actual_format = 0;
@@ -320,15 +336,25 @@ static void get_window_type_and_strut(Window w, Client *c) {
                 c->strut_right  = vals[1];
                 c->strut_top    = vals[2];
                 c->strut_bottom = vals[3];
-                if (c->strut_top || c->strut_bottom || c->strut_left || c->strut_right) {
-                    c->is_dock = 1;
-                }
+            }
+            if (nitems >= 12) {
+                c->strut_left_start_y   = vals[4];
+                c->strut_left_end_y     = vals[5];
+                c->strut_right_start_y  = vals[6];
+                c->strut_right_end_y    = vals[7];
+                c->strut_top_start_x    = vals[8];
+                c->strut_top_end_x      = vals[9];
+                c->strut_bottom_start_x = vals[10];
+                c->strut_bottom_end_x   = vals[11];
+                /* if any non-zero, treat as dock */
+                if (c->strut_left || c->strut_right || c->strut_top || c->strut_bottom) c->is_dock = 1;
             }
             XFree(prop); prop = NULL;
         }
     }
 }
 
+/* Compute reserved areas from all docks (keep existing semantics: max per side) */
 static void update_global_struts(void) {
     reserved_top = reserved_bottom = reserved_left = reserved_right = 0;
     for (Client *c = clients; c; c = c->next) {
@@ -340,6 +366,7 @@ static void update_global_struts(void) {
     }
 }
 
+/* set _NET_WM_STATE _ABOVE for compositors */
 static void set_dock_above_property(Window w) {
     if (NET_WM_STATE == None || NET_WM_STATE_ABOVE == None) return;
     Atom atoms[1] = { NET_WM_STATE_ABOVE };
@@ -354,6 +381,85 @@ static void restack_docks(void) {
             XRaiseWindow(dpy, c->win);  /* raise dock last */
         }
     }
+}
+
+/* Enforce the dock geometry derived from struts.
+ * If partial fields are present, use them to size and position the dock exactly.
+ * Otherwise, fallback to sizing using primary strut sizes.
+ */
+static void apply_dock_geometry(Client *c) {
+    if (!c || !c->is_dock) return;
+
+    int sw = DisplayWidth(dpy, screen_num);
+    int sh = DisplayHeight(dpy, screen_num);
+
+    int new_x = 0, new_y = 0, new_w = (int)c->w, new_h = (int)c->h;
+
+    if (c->strut_top > 0) {
+        new_y = 0;
+        /* try top partial start/end */
+        if (c->strut_top_end_x > c->strut_top_start_x) {
+            new_x = (int)c->strut_top_start_x;
+            new_w = (int)(c->strut_top_end_x - c->strut_top_start_x + 1);
+        } else {
+            /* fallback span full width minus left/right reserves */
+            new_x = 0;
+            new_w = sw - reserved_left - reserved_right;
+        }
+        new_h = (int)c->strut_top;
+    } else if (c->strut_bottom > 0) {
+        new_h = (int)c->strut_bottom;
+        new_y = sh - new_h;
+        if (c->strut_bottom_end_x > c->strut_bottom_start_x) {
+            new_x = (int)c->strut_bottom_start_x;
+            new_w = (int)(c->strut_bottom_end_x - c->strut_bottom_start_x + 1);
+        } else {
+            new_x = 0;
+            new_w = sw - reserved_left - reserved_right;
+        }
+    } else if (c->strut_left > 0) {
+        new_x = 0;
+        new_w = (int)c->strut_left;
+        if (c->strut_left_end_y > c->strut_left_start_y) {
+            new_y = (int)c->strut_left_start_y;
+            new_h = (int)(c->strut_left_end_y - c->strut_left_start_y + 1);
+        } else {
+            new_y = 0;
+            new_h = sh - reserved_top - reserved_bottom;
+        }
+    } else if (c->strut_right > 0) {
+        new_w = (int)c->strut_right;
+        new_x = sw - new_w;
+        if (c->strut_right_end_y > c->strut_right_start_y) {
+            new_y = (int)c->strut_right_start_y;
+            new_h = (int)(c->strut_right_end_y - c->strut_right_start_y + 1);
+        } else {
+            new_y = 0;
+            new_h = sh - reserved_top - reserved_bottom;
+        }
+    } else {
+        /* Not a real strut; keep current geometry (but ensure mapped/global) */
+        new_x = c->x;
+        new_y = c->y;
+        new_w = c->w;
+        new_h = c->h;
+    }
+
+    /* clamp / sanity */
+    if (new_x < 0) new_x = 0;
+    if (new_y < 0) new_y = 0;
+    if (new_w < 1) new_w = 1;
+    if (new_h < 1) new_h = 1;
+    if (new_x + new_w > sw) new_w = sw - new_x;
+    if (new_y + new_h > sh) new_h = sh - new_y;
+
+    /* apply and remember */
+    c->x = new_x;
+    c->y = new_y;
+    c->w = (unsigned int)new_w;
+    c->h = (unsigned int)new_h;
+
+    XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 }
 
 /* --- borders --- */
@@ -391,7 +497,7 @@ static void manage(Window w) {
     c->win = w;
     c->workspace = current_workspace;
 
-    /* detect dock/panel + read strut */
+    /* detect dock/panel + read strut (fills partials too) */
     get_window_type_and_strut(w, c);
 
     /* if override-redirect and not a dock -> ignore (like many tooltips) */
@@ -421,9 +527,9 @@ static void manage(Window w) {
 
     XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
-    /* docks get minimal events to avoid focus on Enter/PointerMotion */
+    /* docks get minimal events to avoid focus on Enter/PointerMotion, but we do want PropertyChange */
     if (c->is_dock) {
-        XSelectInput(dpy, c->win, ExposureMask | StructureNotifyMask);
+        XSelectInput(dpy, c->win, ExposureMask | StructureNotifyMask | PropertyChangeMask);
     } else {
         XSelectInput(dpy, c->win, EnterWindowMask | FocusChangeMask | PropertyChangeMask | StructureNotifyMask | ButtonPressMask);
     }
@@ -435,6 +541,9 @@ static void manage(Window w) {
     if (c->is_dock) {
         /* docks: visible on all workspaces, don't tile, don't take focus */
         c->workspace = -1; /* mark as global */
+
+        /* enforce geometry derived from struts (important) */
+        apply_dock_geometry(c);
 
         /* set above state for compositors */
         set_dock_above_property(c->win);
@@ -494,6 +603,9 @@ static void unmanage(Window w) {
 /* --- move / resize --- */
 static void move_client(Client *c, int start_root_x, int start_root_y, int start_x, int start_y) {
     if (!c) return;
+    /* defensive: don't allow moving docks */
+    if (c->is_dock) return;
+
     XEvent ev;
     Cursor cur = XCreateFontCursor(dpy, MOVE_CURSOR);
     XGrabPointer(dpy, root, False,
@@ -517,6 +629,9 @@ static void move_client(Client *c, int start_root_x, int start_root_y, int start
 
 static void resize_client(Client *c, int start_root_x, int start_root_y, unsigned int start_w, unsigned int start_h) {
     if (!c) return;
+    /* defensive: don't allow resizing docks */
+    if (c->is_dock) return;
+
     XEvent ev;
     Cursor cur = XCreateFontCursor(dpy, RESIZE_CURSOR);
     XGrabPointer(dpy, root, False,
@@ -1101,6 +1216,21 @@ static void handle_unmapnotify(XEvent *ev) { (void)ev; }
 
 static void handle_configurerequest(XEvent *ev) {
     XConfigureRequestEvent *e = &ev->xconfigurerequest;
+    Client *c = find_client(e->window);
+
+    /* If it's a dock: ignore external configure requests — the WM enforces dock geometry.
+     * Otherwise allow normal configure request handling.
+     */
+    if (c && c->is_dock) {
+        /* Re-read strut in case it changed and reapply geometry */
+        get_window_type_and_strut(e->window, c);
+        apply_dock_geometry(c);
+        update_global_struts();
+        update_borders();
+        write_occupied_workspace_file();
+        return;
+    }
+
     XWindowChanges changes;
     changes.x = e->x; changes.y = e->y;
     changes.width = e->width; changes.height = e->height;
@@ -1108,7 +1238,6 @@ static void handle_configurerequest(XEvent *ev) {
     changes.sibling = e->above; changes.stack_mode = e->detail;
     XConfigureWindow(dpy, e->window, e->value_mask, &changes);
 
-    Client *c = find_client(e->window);
     if (c) {
         XWindowAttributes wa;
         if (XGetWindowAttributes(dpy, e->window, &wa)) {
@@ -1136,9 +1265,12 @@ static void handle_buttonpress(XEvent *ev) {
     Client *c = find_toplevel_client_from_window(clicked);
     if (!c) return;
 
+    /* For docks: ignore interactions that would move/resize/focus them.
+     * If you want click-to-activate bar buttons, change this to only
+     * ignore Button1/3 move/resize behavior. For now we simply ignore.
+     */
     if (c->is_dock) {
-        /* optionally ignore clicks by returning here */
-        /* return; */
+        return;
     }
 
     make_priority(c);
@@ -1230,6 +1362,26 @@ static void handle_clientmessage(XEvent *ev) {
     }
 }
 
+/* PropertyNotify handler to detect when a dock changes its strut or type. */
+static void handle_propertynotify(XEvent *ev) {
+    XPropertyEvent *pe = &ev->xproperty;
+    if (!pe) return;
+    Client *c = find_client(pe->window);
+    if (!c) return;
+    if (!c->is_dock) return;
+
+    if (pe->atom == NET_WM_STRUT_PARTIAL || pe->atom == NET_WM_WINDOW_TYPE) {
+        /* re-read strut and reapply geometry */
+        get_window_type_and_strut(c->win, c);
+        apply_dock_geometry(c);
+        update_global_struts();
+        /* re-tile visible workspace(s) */
+        for (int i = 0; i < MAX_WORKSPACES; ++i)
+            if (tag_mode[i] == MODE_TILING) tile_workspace(i);
+        update_borders();
+    }
+}
+
 /* --- autolaunch / scan / loop --- */
 static void run_autolaunch(void) {
     const char *home = getenv("HOME");
@@ -1276,6 +1428,7 @@ static void run_loop(void) {
             case KeyPress:         handle_keypress(&ev); break;
             case KeyRelease:       handle_keyrelease(&ev); break;
             case ClientMessage:    handle_clientmessage(&ev); break;
+            case PropertyNotify:   handle_propertynotify(&ev); break;
             default:               break;
         }
     }
