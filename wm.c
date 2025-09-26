@@ -1,14 +1,11 @@
-/* hsdwm — dock handling tightened: full STRUT_PARTIAL support, prevent moves/resizes,
- * property watching and reapply geometry on changes.
+/* hsdwm — dock handling tightened + dwindle layout
  *
- * - docks detected (NET_WM_WINDOW_TYPE_DOCK / _NET_WM_STRUT_PARTIAL 12 cardinals)
- * - docks are workspace = -1, is_dock = 1
- * - docks get minimal event masks (no Enter/PointerMotion) and PropertyChangeMask
- * - restack_docks() raises docks after other raises (prevents being covered)
- * - focus / tiling skip dock windows
- * - docks cannot be moved/resized by pointer or configure requests
+ * added:
+ *  - dwindle layout (spiral split) alongside existing master layout
+ *  - workspace_layout[] and DEFAULT_LAYOUT_NAME to pick default layout by name
+ *  - set_workspace_layout() / set_layout_for_all() helpers
  *
- * Edit gap_outer and gap_inner near the top to configure layout gaps.
+ * usage: edit DEFAULT_LAYOUT_NAME near the top or call set_workspace_layout()
  */
 
 #ifndef BORDER_PX_FOCUSED
@@ -37,6 +34,10 @@
 
 #ifndef DEFAULT_MASTER_FACTOR
 #  define DEFAULT_MASTER_FACTOR 60  /* percent width for master area */
+#endif
+
+#ifndef DEFAULT_LAYOUT_NAME
+#  define DEFAULT_LAYOUT_NAME "master"  /* master  or  dwindle */
 #endif
 
 #define _POSIX_C_SOURCE 200809L
@@ -74,6 +75,11 @@ static int gap_inner = 8;   /* gap between master and stack */
 
 /* --- modes --- */
 enum { MODE_FLOATING = 0, MODE_TILING = 1 };
+
+/* --- layouts --- */
+enum { LAYOUT_MASTER = 0, LAYOUT_DWINDLE = 1 };
+static int workspace_layout[MAX_WORKSPACES];
+static const char *layout_names[] = { "master", "dwindle" };
 
 /* --- client --- */
 typedef struct Client {
@@ -172,6 +178,10 @@ static void set_dock_above_property(Window w);
 static void restack_docks(void);
 static void apply_dock_geometry(Client *c); /* compute & enforce geometry from strut */
 static void handle_propertynotify(XEvent *ev);
+
+/* dwindle helpers */
+static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, int h, int horiz, int b, int inner_gap);
+static Client **collect_workspace_clients(int ws, int *out_count);
 
 /* --- helpers --- */
 static void die(const char *msg) {
@@ -687,6 +697,7 @@ static void tile_workspace(int ws) {
     int origin_x = effective_outer + left_reserve;
     int origin_y = effective_outer + top_reserve;
 
+    /* if a single client just fill area */
     if (count == 1) {
         for (Client *c = clients; c; c = c->next) if (c->workspace == ws) {
             c->x = origin_x;
@@ -699,44 +710,147 @@ static void tile_workspace(int ws) {
         return;
     }
 
-    int master_w = (avail_w * DEFAULT_MASTER_FACTOR) / 100;
-    if (master_w < MIN_WIN_W) master_w = MIN_WIN_W;
+    /* choose layout for this workspace */
+    int layout = workspace_layout[ws];
+    if (layout == LAYOUT_MASTER) {
+        int master_w = (avail_w * DEFAULT_MASTER_FACTOR) / 100;
+        if (master_w < MIN_WIN_W) master_w = MIN_WIN_W;
 
-    int stack_w = avail_w - master_w - inner_gap;
-    if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
+        int stack_w = avail_w - master_w - inner_gap;
+        if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
 
-    /* fix for MIN_WIN_W constant usage: ensure stack_w not absurd */
-    if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
+        if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
 
-    int idx = 0;
-    int stack_count = count - 1;
-    int stack_idx = 0;
+        int idx = 0;
+        int stack_count = count - 1;
+        int stack_idx = 0;
 
-    int total_stack_gap = (stack_count > 0) ? (stack_count - 1) * inner_gap : 0;
-    int stack_each_h = (stack_count > 0) ? (avail_h - total_stack_gap) / stack_count : avail_h;
+        int total_stack_gap = (stack_count > 0) ? (stack_count - 1) * inner_gap : 0;
+        int stack_each_h = (stack_count > 0) ? (avail_h - total_stack_gap) / stack_count : avail_h;
 
-    for (Client *c = clients; c; c = c->next) {
-        if (c->workspace != ws) continue;
-        if (idx == 0) {
-            c->x = origin_x;
-            c->y = origin_y;
-            c->w = (unsigned int)(master_w - 2 * b);
-            c->h = (unsigned int)(avail_h - 2 * b);
-            clamp_size(&c->w, &c->h);
-            XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
-        } else {
-            int ny = origin_y + stack_idx * (stack_each_h + inner_gap);
-            int nh = (stack_idx == stack_count - 1) ? (avail_h - (stack_each_h + inner_gap) * (stack_count - 1)) : stack_each_h;
+        for (Client *c = clients; c; c = c->next) {
+            if (c->workspace != ws) continue;
+            if (idx == 0) {
+                c->x = origin_x;
+                c->y = origin_y;
+                c->w = (unsigned int)(master_w - 2 * b);
+                c->h = (unsigned int)(avail_h - 2 * b);
+                clamp_size(&c->w, &c->h);
+                XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+            } else {
+                int ny = origin_y + stack_idx * (stack_each_h + inner_gap);
+                int nh = (stack_idx == stack_count - 1) ? (avail_h - (stack_each_h + inner_gap) * (stack_count - 1)) : stack_each_h;
 
-            c->x = origin_x + master_w + inner_gap;
-            c->y = ny;
-            c->w = (unsigned int)(stack_w - 2 * b);
-            c->h = (unsigned int)(nh - 2 * b);
-            clamp_size(&c->w, &c->h);
-            XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
-            ++stack_idx;
+                c->x = origin_x + master_w + inner_gap;
+                c->y = ny;
+                c->w = (unsigned int)(stack_w - 2 * b);
+                c->h = (unsigned int)(nh - 2 * b);
+                clamp_size(&c->w, &c->h);
+                XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+                ++stack_idx;
+            }
+            ++idx;
         }
-        ++idx;
+        return;
+    }
+
+    /* dwindle layout: spiral like alternating splits
+     * we tile clients in client-list order using dwindle_tile()
+     */
+    int cnt = 0;
+    Client **arr = collect_workspace_clients(ws, &cnt);
+    if (!arr || cnt == 0) { free(arr); return; }
+
+    dwindle_tile(arr, 0, cnt, origin_x, origin_y, avail_w, avail_h, 0, b, inner_gap);
+
+    free(arr);
+}
+
+/* set workspace layout by index (LAYOUT_MASTER or LAYOUT_DWINDLE) */
+static void set_workspace_layout(int ws, int layout) {
+    if (ws < 0 || ws >= MAX_WORKSPACES) return;
+    workspace_layout[ws] = (layout == LAYOUT_DWINDLE) ? LAYOUT_DWINDLE : LAYOUT_MASTER;
+    if (tag_mode[ws] == MODE_TILING) tile_workspace(ws);
+}
+
+static void set_layout_for_all(int layout) {
+    for (int w = 0; w < MAX_WORKSPACES; ++w) {
+        workspace_layout[w] = (layout == LAYOUT_DWINDLE) ? LAYOUT_DWINDLE : LAYOUT_MASTER;
+        if (tag_mode[w] == MODE_TILING) tile_workspace(w);
+    }
+}
+
+/* dwindle recursive tiler
+ * arr[start] is placed first in the available rect then we recurse on remaining
+ * horiz == 0 -> split vertically (place first on left)
+ * horiz == 1 -> split horizontally (place first on top)
+ */
+static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, int h, int horiz, int b, int inner_gap) {
+    if (n <= 0) return;
+    if (n == 1) {
+        Client *c = arr[start];
+        c->x = x;
+        c->y = y;
+        int ww = w - 2 * b;
+        int hh = h - 2 * b;
+        if (ww < 1) ww = 1;
+        if (hh < 1) hh = 1;
+        c->w = (unsigned int)ww;
+        c->h = (unsigned int)hh;
+        clamp_size(&c->w, &c->h);
+        XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+        return;
+    }
+
+    /* compute split amount based on DEFAULT_MASTER_FACTOR */
+    if (horiz == 0) {
+        int amount = (w * DEFAULT_MASTER_FACTOR) / 100;
+        if (amount < MIN_WIN_W) amount = MIN_WIN_W;
+        if (amount > w - (MIN_WIN_W + inner_gap)) amount = w - (MIN_WIN_W + inner_gap);
+        if (amount < 1) amount = 1;
+
+        /* place first client on left */
+        Client *c = arr[start];
+        c->x = x;
+        c->y = y;
+        int ww = amount - 2 * b;
+        int hh = h - 2 * b;
+        if (ww < 1) ww = 1;
+        if (hh < 1) hh = 1;
+        c->w = (unsigned int)ww;
+        c->h = (unsigned int)hh;
+        clamp_size(&c->w, &c->h);
+        XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+
+        /* recurse on remaining to the right, flip orientation */
+        int nx = x + amount + inner_gap;
+        int nw = w - amount - inner_gap;
+        if (nw < MIN_WIN_W) nw = MIN_WIN_W;
+        dwindle_tile(arr, start + 1, n - 1, nx, y, nw, h, 1, b, inner_gap);
+    } else {
+        int amount = (h * DEFAULT_MASTER_FACTOR) / 100;
+        if (amount < MIN_WIN_H) amount = MIN_WIN_H;
+        if (amount > h - (MIN_WIN_H + inner_gap)) amount = h - (MIN_WIN_H + inner_gap);
+        if (amount < 1) amount = 1;
+
+        /* place first client on top */
+        Client *c = arr[start];
+        c->x = x;
+        c->y = y;
+        int ww = w - 2 * b;
+        int hh = amount - 2 * b;
+        if (ww < 1) ww = 1;
+        if (hh < 1) hh = 1;
+        c->w = (unsigned int)ww;
+        c->h = (unsigned int)hh;
+        clamp_size(&c->w, &c->h);
+        XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+
+        /* recurse on remaining below, flip orientation */
+        int ny = y + amount + inner_gap;
+        int nh = h - amount - inner_gap;
+        if (nh < MIN_WIN_H) nh = MIN_WIN_H;
+        dwindle_tile(arr, start + 1, n - 1, x, ny, w, nh, 0, b, inner_gap);
     }
 }
 
@@ -1507,6 +1621,12 @@ int main(void) {
     border_unfocus_width = BORDER_PX_UNFOCUSED;
 
     for (int i = 0; i < MAX_WORKSPACES; ++i) tag_mode[i] = (DEFAULT_TAG_MODE ? MODE_TILING : MODE_FLOATING);
+
+    /* init workspace layout from DEFAULT_LAYOUT_NAME */
+    for (int i = 0; i < MAX_WORKSPACES; ++i) {
+        if (strcmp(DEFAULT_LAYOUT_NAME, "dwindle") == 0) workspace_layout[i] = LAYOUT_DWINDLE;
+        else workspace_layout[i] = LAYOUT_MASTER;
+    }
 
     if (XSelectInput(dpy, root,
                      SubstructureRedirectMask | SubstructureNotifyMask |

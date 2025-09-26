@@ -10,3 +10,5 @@ thing: wm.c
 clean:
 	rm -f thing
 
+remake: clean thing
+
