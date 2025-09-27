@@ -1,5 +1,8 @@
 # hsdwm
 itsy bitsy x11 window manager
+
+![preview](.examples/a.png)
+
 ## features
 
 - floating + tiling (per workspace)
@@ -34,8 +37,5 @@ edit #define values at the top of wm.c for:
 
 ---
 
-![preview](.examples/preview.png)
-![preview](.examples/previewtiling.png)
-![preview](.examples/extrapreview.png)
 
 
