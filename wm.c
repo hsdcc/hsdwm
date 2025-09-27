@@ -37,7 +37,7 @@
 #endif
 
 #ifndef DEFAULT_LAYOUT_NAME
-#  define DEFAULT_LAYOUT_NAME "master"  /* master  or  dwindle */
+#  define DEFAULT_LAYOUT_NAME "dwindle"  /* master  or  dwindle */
 #endif
 
 #define _POSIX_C_SOURCE 200809L
@@ -1278,49 +1278,44 @@ static Client **collect_workspace_clients(int ws, int *out_count) {
     return arr;
 }
 
-/* focus_in_direction with master/stack behavior */
+/* focus_in_direction (reworked)
+ * Use the geometric neighbor finder for all modes. The previous master/stack
+ * special-casing caused buggy behavior; now we always pick the best geometric
+ * neighbor in the requested direction. If no window is focused we pick the
+ * "extreme" window on the current workspace (rightmost, leftmost, topmost,
+ * bottommost) which matches the requested direction.
+ */
 static void focus_in_direction(int dir) {
-    if (tag_mode[current_workspace] != MODE_TILING) {
-        Client *cand = find_neighbor_in_direction(focused, dir);
-        if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
-        return;
-    }
-
-    int cnt = 0;
-    Client **arr = collect_workspace_clients(current_workspace, &cnt);
-    if (!arr || cnt == 0) { free(arr); return; }
-
-    Client *master = arr[0];
-    int focused_idx = -1;
-    for (int i = 0; i < cnt; ++i) if (arr[i] == focused) { focused_idx = i; break; }
-
-    if (dir == 0 || dir == 3) {
-        if (focused_idx <= 0) {
-            if (cnt > 1) {
-                Client *cand = arr[1];
-                if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
+    /* helper: pick extreme when nothing is focused */
+    if (!focused) {
+        Client *best = NULL;
+        for (Client *c = clients; c; c = c->next) {
+            if (c->workspace != current_workspace) continue;
+            if (c->is_dock) continue;
+            if (!best) { best = c; continue; }
+            int bcx = best->x + (int)best->w / 2;
+            int bcy = best->y + (int)best->h / 2;
+            int ccx = c->x + (int)c->w / 2;
+            int ccy = c->y + (int)c->h / 2;
+            if (dir == 3) { /* right: pick max center x */
+                if (ccx > bcx) best = c;
+            } else if (dir == 0) { /* left: pick min center x */
+                if (ccx < bcx) best = c;
+            } else if (dir == 2) { /* up: pick min center y */
+                if (ccy < bcy) best = c;
+            } else { /* down: pick max center y */
+                if (ccy > bcy) best = c;
             }
-            free(arr);
-            return;
-        } else {
-            focus_client_proper(master);
-            free(arr);
-            return;
         }
-    } else if (dir == 1 || dir == 2) {
-        if (focused_idx <= 0) { free(arr); return; }
-        int stack_pos = focused_idx - 1;
-        int stack_count = cnt - 1;
-        if (stack_count <= 0) { free(arr); return; }
-        int new_stack_pos = stack_pos + (dir == 1 ? 1 : -1);
-        if (new_stack_pos < 0 || new_stack_pos >= stack_count) { free(arr); return; }
-        Client *cand = arr[1 + new_stack_pos];
-        if (cand && cand->workspace == current_workspace) focus_client_proper(cand);
-        free(arr);
+        if (best) focus_client_proper(best);
         return;
     }
 
-    free(arr);
+    /* normally, use geometric neighbor finder */
+    Client *cand = find_neighbor_in_direction(focused, dir);
+    if (cand && cand->workspace == current_workspace && !cand->is_dock) {
+        focus_client_proper(cand);
+    }
 }
 
 /* --- event handlers --- */
