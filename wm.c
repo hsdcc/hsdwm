@@ -641,6 +641,8 @@ static void resize_client(Client *c, int start_root_x, int start_root_y, unsigne
     if (!c) return;
     /* defensive: don't allow resizing docks */
     if (c->is_dock) return;
+    /* don't allow resizing tiling windows */
+    if (c->workspace >= 0 && c->workspace < MAX_WORKSPACES && tag_mode[c->workspace] == MODE_TILING) return;
 
     XEvent ev;
     Cursor cur = XCreateFontCursor(dpy, RESIZE_CURSOR);
