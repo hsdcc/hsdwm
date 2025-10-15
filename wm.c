@@ -677,29 +677,27 @@ static void tile_workspace(int ws) {
     int rw = DisplayWidth(dpy, screen_num);
     int rh = DisplayHeight(dpy, screen_num);
 
-    int outer_gap = gap_outer;
-    int inner_gap = gap_inner;
+    int outer_gap = gap_outer < 0 ? 0 : gap_outer;
+    int inner_gap = gap_inner < 0 ? 0 : gap_inner;
 
     int b = (int)border_unfocus_width;
 
-    /* account for reserved dock areas */
+    // account for reserved dock areas
     int top_reserve = reserved_top;
     int bottom_reserve = reserved_bottom;
     int left_reserve = reserved_left;
     int right_reserve = reserved_right;
 
-    /* effective outer gap includes border thickness to avoid overlap */
-    int effective_outer = outer_gap + b;
-
-    int avail_w = rw - 2 * effective_outer - left_reserve - right_reserve;
-    int avail_h = rh - 2 * effective_outer - top_reserve - bottom_reserve;
+    // effective outer gap does NOT include border thickness (border is handled per window)
+    int avail_w = rw - 2 * outer_gap - left_reserve - right_reserve;
+    int avail_h = rh - 2 * outer_gap - top_reserve - bottom_reserve;
     if (avail_w < MIN_WIN_W) avail_w = MIN_WIN_W;
     if (avail_h < MIN_WIN_H) avail_h = MIN_WIN_H;
 
-    int origin_x = effective_outer + left_reserve;
-    int origin_y = effective_outer + top_reserve;
+    int origin_x = outer_gap + left_reserve;
+    int origin_y = outer_gap + top_reserve;
 
-    /* if a single client just fill area */
+    // if a single client just fill area
     if (count == 1) {
         for (Client *c = clients; c; c = c->next) if (c->workspace == ws) {
             c->x = origin_x;
@@ -712,15 +710,13 @@ static void tile_workspace(int ws) {
         return;
     }
 
-    /* choose layout for this workspace */
+    // choose layout for this workspace
     int layout = workspace_layout[ws];
     if (layout == LAYOUT_MASTER) {
         int master_w = (avail_w * DEFAULT_MASTER_FACTOR) / 100;
         if (master_w < MIN_WIN_W) master_w = MIN_WIN_W;
 
         int stack_w = avail_w - master_w - inner_gap;
-        if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
-
         if (stack_w < MIN_WIN_W) stack_w = MIN_WIN_W;
 
         int idx = 0;
@@ -756,9 +752,7 @@ static void tile_workspace(int ws) {
         return;
     }
 
-    /* dwindle layout: spiral like alternating splits
-     * we tile clients in client-list order using dwindle_tile()
-     */
+    // dwindle layout: spiral like alternating splits
     int cnt = 0;
     Client **arr = collect_workspace_clients(ws, &cnt);
     if (!arr || cnt == 0) { free(arr); return; }
@@ -804,14 +798,14 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         return;
     }
 
-    /* compute split amount based on DEFAULT_MASTER_FACTOR */
+    // compute split amount based on DEFAULT_MASTER_FACTOR
     if (horiz == 0) {
         int amount = (w * DEFAULT_MASTER_FACTOR) / 100;
         if (amount < MIN_WIN_W) amount = MIN_WIN_W;
         if (amount > w - (MIN_WIN_W + inner_gap)) amount = w - (MIN_WIN_W + inner_gap);
         if (amount < 1) amount = 1;
 
-        /* place first client on left */
+        // place first client on left
         Client *c = arr[start];
         c->x = x;
         c->y = y;
@@ -824,7 +818,7 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         clamp_size(&c->w, &c->h);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
-        /* recurse on remaining to the right, flip orientation */
+        // recurse on remaining to the right, flip orientation
         int nx = x + amount + inner_gap;
         int nw = w - amount - inner_gap;
         if (nw < MIN_WIN_W) nw = MIN_WIN_W;
@@ -835,7 +829,7 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         if (amount > h - (MIN_WIN_H + inner_gap)) amount = h - (MIN_WIN_H + inner_gap);
         if (amount < 1) amount = 1;
 
-        /* place first client on top */
+        // place first client on top
         Client *c = arr[start];
         c->x = x;
         c->y = y;
@@ -848,7 +842,7 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         clamp_size(&c->w, &c->h);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
-        /* recurse on remaining below, flip orientation */
+        // recurse on remaining below, flip orientation
         int ny = y + amount + inner_gap;
         int nh = h - amount - inner_gap;
         if (nh < MIN_WIN_H) nh = MIN_WIN_H;
@@ -1184,7 +1178,6 @@ static Client *find_neighbor_in_direction(Client *cur, int dir) {
     return best;
 }
 
-/* swap two nodes... (no focus side-effect here: caller decides focus) */
 static void swap_clients(Client *a, Client *b) {
     if (!a || !b || a == b) return;
     if (a->workspace != b->workspace) return;
@@ -1533,7 +1526,7 @@ static void run_autolaunch(void) {
     if (!home) return;
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/.local/bin/autolaunch.sh", home);
-    if (access(path, X_OK) == 0) {
+    if (access(path, F_OK) == 0) {
         pid_t pid = fork();
         if (pid == 0) {
             if (dpy) close(ConnectionNumber(dpy));
