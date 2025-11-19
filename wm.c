@@ -70,8 +70,8 @@ static char *term_cmd[]  = { "xterm", NULL };
 static char *dmenu_cmd[] = { "dmenu_run", NULL };
 
 /* --- gap configuration (edit before compile) --- */
-static int gap_outer = 24;   /* outer gap on both sides */
-static int gap_inner = 8;   /* gap between master and stack */
+static int gap_outer = 0;   /* outer gap on both sides */
+static int gap_inner = 0;   /* gap between master and stack */
 
 /* --- modes --- */
 enum { MODE_FLOATING = 0, MODE_TILING = 1 };
@@ -702,8 +702,11 @@ static void tile_workspace(int ws) {
         for (Client *c = clients; c; c = c->next) if (c->workspace == ws) {
             c->x = origin_x;
             c->y = origin_y;
-            c->w = (unsigned int)(avail_w - 2 * b);
-            c->h = (unsigned int)(avail_h - 2 * b);
+            c->w = (unsigned int)(avail_w);
+            c->h = (unsigned int)(avail_h);
+            // Subtract borders after calculating the base dimensions
+            if ((int)c->w > 2 * b) c->w -= 2 * b;
+            if ((int)c->h > 2 * b) c->h -= 2 * b;
             clamp_size(&c->w, &c->h);
             XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
         }
@@ -724,25 +727,75 @@ static void tile_workspace(int ws) {
         int stack_idx = 0;
 
         int total_stack_gap = (stack_count > 0) ? (stack_count - 1) * inner_gap : 0;
-        int stack_each_h = (stack_count > 0) ? (avail_h - total_stack_gap) / stack_count : avail_h;
+        
+        // Calculate stack height accounting for gaps and borders
+        int stack_area_h = avail_h;
+        if (stack_count > 1) {
+            stack_area_h = avail_h - total_stack_gap;
+        }
+        
+        int stack_each_h = (stack_count > 0) ? stack_area_h / stack_count : 0;
+        if (stack_count > 0 && stack_each_h < MIN_WIN_H) {
+            // If individual stack windows would be too small, recalculate
+            stack_each_h = MIN_WIN_H;
+            // Adjust stack_area_h to fit all windows with minimal height
+            if (stack_count > 1) {
+                stack_area_h = stack_count * stack_each_h + (stack_count - 1) * inner_gap;
+                // Adjust master height to accommodate stack height
+                int remaining_h = avail_h - stack_area_h;
+                if (remaining_h < MIN_WIN_H) {
+                    // Distribute space more proportionally if not enough space
+                    int total_req = MIN_WIN_H * count + (stack_count > 1 ? (stack_count - 1) * inner_gap : 0);
+                    if (total_req > avail_h) {
+                        // Too small to accommodate all windows properly
+                        // Distribute available height equally
+                        master_w = avail_w / 2;
+                        stack_w = avail_w - master_w - inner_gap;
+                        stack_each_h = avail_h / count;
+                    }
+                }
+            }
+        }
 
         for (Client *c = clients; c; c = c->next) {
             if (c->workspace != ws) continue;
             if (idx == 0) {
+                // Master window
                 c->x = origin_x;
                 c->y = origin_y;
-                c->w = (unsigned int)(master_w - 2 * b);
-                c->h = (unsigned int)(avail_h - 2 * b);
+                c->w = (unsigned int)(master_w);
+                c->h = (unsigned int)(avail_h);
+                // Subtract borders after calculating the base dimensions
+                if ((int)c->w > 2 * b) c->w -= 2 * b;
+                if ((int)c->h > 2 * b) c->h -= 2 * b;
                 clamp_size(&c->w, &c->h);
                 XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
             } else {
-                int ny = origin_y + stack_idx * (stack_each_h + inner_gap);
-                int nh = (stack_idx == stack_count - 1) ? (avail_h - (stack_each_h + inner_gap) * (stack_count - 1)) : stack_each_h;
+                // Stack windows
+                int ny = origin_y;
+                int nh = (stack_count > 0) ? stack_each_h : avail_h;
+                
+                // Calculate the y position and height for each stack window
+                if (stack_count > 1) {
+                    ny = origin_y + stack_idx * (stack_each_h + inner_gap);
+                    // For the last window, make sure it fills the remaining space
+                    if (stack_idx == stack_count - 1) {
+                        int used_space = stack_idx * (stack_each_h + inner_gap);
+                        nh = avail_h - used_space;
+                        if (nh < MIN_WIN_H) nh = MIN_WIN_H;
+                    }
+                } else {
+                    // Only one stack window
+                    nh = avail_h;
+                }
 
                 c->x = origin_x + master_w + inner_gap;
                 c->y = ny;
-                c->w = (unsigned int)(stack_w - 2 * b);
-                c->h = (unsigned int)(nh - 2 * b);
+                c->w = (unsigned int)(stack_w);
+                c->h = (unsigned int)(nh);
+                // Subtract borders after calculating the base dimensions
+                if ((int)c->w > 2 * b) c->w -= 2 * b;
+                if ((int)c->h > 2 * b) c->h -= 2 * b;
                 clamp_size(&c->w, &c->h);
                 XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
                 ++stack_idx;
@@ -787,12 +840,13 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         Client *c = arr[start];
         c->x = x;
         c->y = y;
-        int ww = w - 2 * b;
-        int hh = h - 2 * b;
-        if (ww < 1) ww = 1;
-        if (hh < 1) hh = 1;
-        c->w = (unsigned int)ww;
-        c->h = (unsigned int)hh;
+        c->w = (unsigned int)(w);
+        c->h = (unsigned int)(h);
+        // Subtract borders after calculating the base dimensions
+        if ((int)c->w > 2 * b) c->w -= 2 * b;
+        if ((int)c->h > 2 * b) c->h -= 2 * b;
+        if ((int)c->w < 1) c->w = 1;
+        if ((int)c->h < 1) c->h = 1;
         clamp_size(&c->w, &c->h);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
         return;
@@ -809,12 +863,13 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         Client *c = arr[start];
         c->x = x;
         c->y = y;
-        int ww = amount - 2 * b;
-        int hh = h - 2 * b;
-        if (ww < 1) ww = 1;
-        if (hh < 1) hh = 1;
-        c->w = (unsigned int)ww;
-        c->h = (unsigned int)hh;
+        c->w = (unsigned int)(amount);
+        c->h = (unsigned int)(h);
+        // Subtract borders after calculating the base dimensions
+        if ((int)c->w > 2 * b) c->w -= 2 * b;
+        if ((int)c->h > 2 * b) c->h -= 2 * b;
+        if ((int)c->w < 1) c->w = 1;
+        if ((int)c->h < 1) c->h = 1;
         clamp_size(&c->w, &c->h);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
@@ -833,12 +888,13 @@ static void dwindle_tile(Client **arr, int start, int n, int x, int y, int w, in
         Client *c = arr[start];
         c->x = x;
         c->y = y;
-        int ww = w - 2 * b;
-        int hh = amount - 2 * b;
-        if (ww < 1) ww = 1;
-        if (hh < 1) hh = 1;
-        c->w = (unsigned int)ww;
-        c->h = (unsigned int)hh;
+        c->w = (unsigned int)(w);
+        c->h = (unsigned int)(amount);
+        // Subtract borders after calculating the base dimensions
+        if ((int)c->w > 2 * b) c->w -= 2 * b;
+        if ((int)c->h > 2 * b) c->h -= 2 * b;
+        if ((int)c->w < 1) c->w = 1;
+        if ((int)c->h < 1) c->h = 1;
         clamp_size(&c->w, &c->h);
         XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
 
