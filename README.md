@@ -1,3 +1,6 @@
+# deprecated ; please look at [hsdwl](github.com/hsdcc/hsdwl)
+
+
 # hsdwm
 itsy bitsy x11 window manager
 
